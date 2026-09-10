@@ -778,7 +778,7 @@ def test_a_raising_honcho_tier_is_spoken_not_swallowed(monkeypatch, lane_on):
 
     out = talk_tools.execute_talk_tool("search_memory", {"query": "x"})
 
-    assert "the memory lookup failed" in out
+    assert "memory lookup failed" in out and "honcho search" in out
     assert "honcho socket closed" in out
 
 

@@ -57,9 +57,10 @@ from typing import Any
 import httpx
 
 try:
-    from . import talk_config
+    from . import talk_config, talk_errors
 except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path load)
     import talk_config
+    import talk_errors
 
 _log = logging.getLogger(__name__)
 
@@ -319,22 +320,46 @@ def start_run(
         )
     except httpx.HTTPError as exc:
         raise TalkApiServerError(
-            f"I couldn't reach the Hermes api server ({type(exc).__name__})"
+            talk_errors.format_exception(
+                "api server run submission",
+                exc,
+                endpoint=RUNS_PATH,
+                phase="submit",
+            )
         ) from exc
     # 202 is the documented success (api_server.py:4464-4468); accept any 2xx
     # so a future 200 does not read as a failure.
     if response.status_code // 100 != 2:
         raise TalkApiServerError(
-            f"the Hermes api server refused the run ({response.status_code}): "
-            f"{response.text[:200] or 'no detail'}"
+            talk_errors.format_failure(
+                "api server run submission",
+                f"HTTP {response.status_code}: {response.text[:200] or 'no detail'}",
+                status=response.status_code,
+                endpoint=RUNS_PATH,
+                phase="submit",
+            )
         )
     try:
         payload = response.json()
     except ValueError as exc:
-        raise TalkApiServerError("the Hermes api server returned a non-JSON run") from exc
+        raise TalkApiServerError(
+            talk_errors.format_exception(
+                "api server run submission",
+                exc,
+                endpoint=RUNS_PATH,
+                phase="decode response",
+            )
+        ) from exc
     run_id = payload.get("run_id") if isinstance(payload, dict) else None
     if not isinstance(run_id, str) or not run_id:
-        raise TalkApiServerError("the Hermes api server returned a run with no id")
+        raise TalkApiServerError(
+            talk_errors.format_failure(
+                "api server run submission",
+                "the response contained no run id",
+                endpoint=RUNS_PATH,
+                phase="validate response",
+            )
+        )
     return run_id
 
 
@@ -349,18 +374,46 @@ def get_run(run_id: str) -> dict:
         )
     except httpx.HTTPError as exc:
         raise TalkApiServerError(
-            f"I lost contact with the Hermes api server ({type(exc).__name__})"
+            talk_errors.format_exception(
+                "api server run status",
+                exc,
+                endpoint=f"{RUNS_PATH}/{{run_id}}",
+                phase="poll",
+            )
         ) from exc
     if response.status_code != 200:
         raise TalkApiServerError(
-            f"the Hermes api server answered {response.status_code} for that run"
+            talk_errors.format_failure(
+                "api server run status",
+                f"HTTP {response.status_code}: {response.text[:200] or 'no detail'}",
+                status=response.status_code,
+                endpoint=f"{RUNS_PATH}/{{run_id}}",
+                phase="poll",
+                run_id=run_id,
+            )
         )
     try:
         payload = response.json()
     except ValueError as exc:
-        raise TalkApiServerError("the Hermes api server returned a non-JSON status") from exc
+        raise TalkApiServerError(
+            talk_errors.format_exception(
+                "api server run status",
+                exc,
+                endpoint=f"{RUNS_PATH}/{{run_id}}",
+                phase="decode response",
+                run_id=run_id,
+            )
+        ) from exc
     if not isinstance(payload, dict):
-        raise TalkApiServerError("the Hermes api server returned an invalid status")
+        raise TalkApiServerError(
+            talk_errors.format_failure(
+                "api server run status",
+                "the response was not a JSON object",
+                endpoint=f"{RUNS_PATH}/{{run_id}}",
+                phase="validate response",
+                run_id=run_id,
+            )
+        )
     return payload
 
 
@@ -380,18 +433,33 @@ def _get_json(path: str, what: str) -> Any:
         )
     except httpx.HTTPError as exc:
         raise TalkApiServerError(
-            f"I lost contact with the Hermes api server ({type(exc).__name__})"
+            talk_errors.format_exception(
+                f"api server {what} request",
+                exc,
+                endpoint=path,
+                phase="request",
+            )
         ) from exc
     if response.status_code != 200:
         raise TalkApiServerError(
-            f"the Hermes api server answered {response.status_code} when I asked "
-            f"about {what}"
+            talk_errors.format_failure(
+                f"api server {what} request",
+                f"HTTP {response.status_code}: {response.text[:200] or 'no detail'}",
+                status=response.status_code,
+                endpoint=path,
+                phase="request",
+            )
         )
     try:
         return response.json()
     except ValueError as exc:
         raise TalkApiServerError(
-            f"the Hermes api server returned a non-JSON {what} response"
+            talk_errors.format_exception(
+                f"api server {what} request",
+                exc,
+                endpoint=path,
+                phase="decode response",
+            )
         ) from exc
 
 
@@ -502,10 +570,24 @@ def run_to_completion(
             ]
         error = run.get("error")
         detail = str(error) if error else "no reason given"
-        return f"the agent run {state}: {detail}"[:MAX_OUTPUT_CHARS]
+        return talk_errors.format_failure(
+            "background agent run",
+            detail,
+            run_id=run_id,
+            status=state,
+            provider=run.get("provider"),
+            model=run.get("model"),
+            endpoint=run.get("endpoint"),
+            phase=run.get("last_event") or "terminal",
+        )[:MAX_OUTPUT_CHARS]
     raise TalkApiServerError(
-        "the agent run is still going after its whole time budget — it may "
-        "still finish, but I stopped waiting"
+        talk_errors.format_failure(
+            "background agent run",
+            "the run is still going after its whole time budget",
+            run_id=run_id,
+            status="timeout",
+            phase="poll",
+        )
     )
 
 

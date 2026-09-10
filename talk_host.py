@@ -57,6 +57,7 @@ try:
         talk_approvals,
         talk_auth,
         talk_config,
+        talk_errors,
         talk_progress,
         talk_runs,
         talk_steer,
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_approvals
     import talk_auth
     import talk_config
+    import talk_errors
     import talk_progress
     import talk_runs
     import talk_steer
@@ -953,7 +955,11 @@ class HostAdapter:
                     MEMORY_TOOL_NAME, {"query": query, "limit": limit}
                 )
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-                return f"the memory lookup failed: {type(exc).__name__}: {exc}"
+                return talk_errors.format_exception(
+                    "memory lookup",
+                    exc,
+                    phase="session search",
+                )
             if not _agent_loop_absent(raw, MEMORY_TOOL_NAME):
                 # Transcript content is untrusted text and the provenance
                 # marker belongs to the Honcho tier alone — a line that
@@ -980,7 +986,11 @@ class HostAdapter:
                     "ask me again in a moment."
                 )
             if kind == "err":
-                return f"the memory lookup failed: {type(value).__name__}: {value}"
+                return talk_errors.format_exception(
+                    "memory lookup",
+                    value,
+                    phase="honcho search",
+                )
             raw = value
             # Only "Honcho isn't here" falls through. A Honcho that IS here
             # and said no — reindexing, rate limited — made a decision that
@@ -1025,7 +1035,11 @@ class HostAdapter:
             # started-then-broken lookup: nothing is in flight to check on.
             return f"I can't look that up yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"I couldn't start that lookup: {type(exc).__name__}: {exc}"
+            return talk_errors.format_exception(
+                "api server memory lookup",
+                exc,
+                phase="submit",
+            )
         return (
             f"{talk_runs.started_sentinel(run_id, 'agent', label)} — asking a "
             "Hermes agent through the api server; I'll tell you what it finds."
@@ -1080,7 +1094,11 @@ class HostAdapter:
             try:
                 raw = ctx.dispatch_tool(DELEGATE_TOOL_NAME, {"goal": prompt})
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-                return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+                return talk_errors.format_exception(
+                    "agent delegation",
+                    exc,
+                    phase="host loop dispatch",
+                )
             if not _agent_loop_absent(raw):
                 spoken = _speakable(raw)
                 if spoken.startswith("that failed"):
@@ -1128,7 +1146,11 @@ class HostAdapter:
         except (talk_runs.RoutingUnavailable, talk_runs.AdmissionRefused) as exc:
             return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+            return talk_errors.format_exception(
+                "api server agent run",
+                exc,
+                phase="submit",
+            )
         return (
             f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running on a "
             "Hermes agent through the api server; I'll tell you when it lands."
@@ -1162,7 +1184,11 @@ class HostAdapter:
         except (talk_runs.RoutingUnavailable, talk_runs.AdmissionRefused) as exc:
             return f"I can't start that yet — {exc}."
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"I couldn't start that work: {type(exc).__name__}: {exc}"
+            return talk_errors.format_exception(
+                "detached agent run",
+                exc,
+                phase="submit",
+            )
         return (
             f"{talk_runs.started_sentinel(run_id, 'agent', label)} — running as a "
             "detached Hermes agent; I'll tell you when it lands."
@@ -1319,7 +1345,12 @@ class HostAdapter:
             try:
                 accepted = bool(steer(agent_id, wire_text))
             except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-                return f"I couldn't get that through: {type(exc).__name__}: {exc}"
+                return talk_errors.format_exception(
+                    "steer subagent",
+                    exc,
+                    phase="dispatch",
+                    agent_id=agent_id,
+                )
             if not accepted:
                 # steer_subagent() False = unknown id, no live agent, OR a
                 # steer failure the host swallowed — it cannot distinguish.
@@ -1651,7 +1682,12 @@ class HostAdapter:
         try:
             stopped = bool(interrupt(target))
         except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-            return f"the stop didn't go through: {type(exc).__name__}: {exc}"
+            return talk_errors.format_exception(
+                "stop subagent",
+                exc,
+                phase="interrupt dispatch",
+                agent_id=target,
+            )
         if not stopped:
             return f"I don't see a running job called {target}."
         talk_steer.mark_superseded(target)
@@ -1859,7 +1895,12 @@ def _steer_via_registry(subagent_id: str, wire_text: str, *, token: str | None =
     try:
         accepted = bool(agent.steer(wire_text))
     except Exception as exc:  # noqa: BLE001 — the model speaks the failure
-        return f"I couldn't get that through to {subagent_id}: {type(exc).__name__}: {exc}"
+        return talk_errors.format_exception(
+            "steer subagent",
+            exc,
+            phase="agent.steer",
+            agent_id=subagent_id,
+        )
 
     if not accepted:
         # AIAgent.steer() returns False ONLY for empty text (run_agent.py:

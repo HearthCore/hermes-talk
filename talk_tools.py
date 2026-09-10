@@ -35,6 +35,7 @@ try:
         talk_config,
         talk_core_realtime,
         talk_doctor,
+        talk_errors,
         talk_host,
         talk_identity,
         talk_pause,
@@ -50,6 +51,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
     import talk_config
     import talk_core_realtime
     import talk_doctor
+    import talk_errors
     import talk_host
     import talk_identity
     import talk_pause
@@ -486,7 +488,11 @@ def execute_talk_tool(name: str, arguments: dict | None) -> str:
         output = handler(arguments or {})
     except Exception as exc:  # noqa: BLE001 — the model speaks the failure
         _log.warning("talk tool %s failed: %s: %s", name, type(exc).__name__, exc)
-        return f"{name} failed: {type(exc).__name__}: {exc}"
+        return talk_errors.format_exception(
+            f"tool {name}",
+            exc,
+            phase="execute",
+        )[:MAX_OUTPUT_CHARS]
     return (output or "(no output)")[:MAX_OUTPUT_CHARS]
 
 
