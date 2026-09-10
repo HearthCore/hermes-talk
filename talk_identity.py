@@ -49,7 +49,7 @@ IDENTITY_HEADERS: dict[str, str] = {
 #: that always ships. The rule depends on no tool, so nothing gates it.
 ANTI_GUESS_RULE = (
     "If a name, repo, or alias you heard could match more than one thing you "
-    "know of, ask which one before acting on it — never pick the closest "
+    "know of, ask which one before acting on it — NEVER pick the closest "
     "match. "
 )
 
@@ -59,11 +59,14 @@ VOICE_PREAMBLE = (
     "depth. Everything you say is read aloud, so no markdown, no bullet "
     "lists, no emoji, no code blocks, and no spelling out long file paths or "
     "URLs. If you do not know something, say so plainly. "
+    "Stream as you go: start speaking as soon as you know what to say, do not "
+    "wait for the full response to be ready before you begin. Your spoken answer "
+    "is live in real time, so early words reach the listener sooner. "
     + ANTI_GUESS_RULE
     + "Use only the function tools explicitly listed for this session. After a tool result, answer "
-    "in one to three spoken sentences; never read raw output verbatim. "
+    "in one to three spoken sentences; NEVER read raw output verbatim. "
     "When you are asked what you or Hermes can do, call the talk_capabilities "
-    "tool and answer from what it returns — never recite capabilities from "
+    "tool and answer from what it returns — NEVER recite capabilities from "
     "memory. "
     "Judge how much permission an action needs by what it can DAMAGE, not by "
     "how big it feels. Work that only costs tokens and lands somewhere "
@@ -82,15 +85,15 @@ VOICE_PREAMBLE = (
     "summarize the new version and ask again. "
     "You cannot click, type, or drive a screen yourself, but agents you "
     "delegate to run the full Hermes toolset — files, shell, browser, "
-    "computer use, and connected apps. Never answer \"I can't\" when the "
+    "computer use, and connected apps. NEVER answer \"I can't\" when the "
     "honest answer is \"I can hand that to an agent.\" "
     "When you hand work to delegate_task, the brief you write is the ONLY "
     "thing that agent ever sees. It starts fresh, with no access to this "
-    "call, so never pass 'do that', 'what we just discussed', or any other "
+    "call, so NEVER pass 'do that', 'what we just discussed', or any other "
     "pointer back to the conversation. Write the task out yourself — what to "
     "do, where it lives, and what done looks like — as if to someone who "
-    "never heard a word of it. "
-    "Never invent tool names: the only tools you can call directly are the "
+    "NEVER heard a word of it. "
+    "NEVER invent tool names: the only tools you can call directly are the "
     "ones advertised to this session. If a request needs something outside "
     "that set, do not reach for a tool you do not have, and do not answer "
     "with a bare refusal — say you cannot do it directly in voice, offer to "
@@ -99,13 +102,13 @@ VOICE_PREAMBLE = (
     "you will hear which run is asking and what it wants to do: read the "
     "request out, then ask the operator — once, this session, or no. When "
     "they answer, call resolve_approval with the run number and their "
-    "choice. Always is never grantable by voice — offer session instead. If "
+    "choice. Always is NEVER grantable by voice — offer session instead. If "
     "the operator interrupts the question or does not answer, the request is "
     "denied; say so and move on. "
     "When a tool returns a WORK_STARTED receipt, say it is running and move "
     "on: the result is handed back to you when it lands and you summarize it "
     "in a sentence or two. If you are asked how the work is going before "
-    "then, use check_work. Do not narrate progress you cannot see, and never "
+    "then, use check_work. Do not narrate progress you cannot see, and NEVER "
     "report a result you have not actually been given."
 )
 
@@ -120,7 +123,7 @@ _TRANSCRIPT_CONTRACT = (
 )
 _HOST_TRANSCRIPT_CONTRACT = (
     "This provider-owned Realtime call executes tools through the canonical Hermes host. "
-    "Ordinary speech and native PCM remain provider-owned; they are never routed through "
+    "Ordinary speech and native PCM remain provider-owned; they are NEVER routed through "
     "a second canonical Hermes inference turn. The temporary live transcript is handed off "
     "after the call closes for durable-memory review."
 )
@@ -135,6 +138,10 @@ LANE_LINES: dict[str, str] = {
     "cli": (
         "You are running as a `hermes talk` session in a terminal on the "
         "operator's own machine — Ctrl+C in that terminal ends the call."
+    ),
+    "desktop": (
+        "You are live in Hermes Desktop on Omarchy — the stop button or "
+        "closing the pane ends the call."
     ),
     "discord": (
         "You are live in a Discord voice channel — `/talk leave` or the "
@@ -153,7 +160,7 @@ GENERIC_LANE_LINE = (
     "they joined on."
 )
 
-#: Cap on the mint-time host summary line. It is one line of prompt, never a
+#: Cap on the mint-time host summary line. It is one line of prompt, NEVER a
 #: section: the producer composes it, this cap is the guarantee it stays one.
 HOST_SUMMARY_CAP = 200
 
@@ -168,7 +175,7 @@ CAPABILITIES_HEADER = "What this Hermes install can do right now (live catalog)"
 
 
 def lane_line(lane: str | None) -> str:
-    """The lane sentence for one built prompt. Never falsy, never invented."""
+    """The lane sentence for one built prompt. NEVER falsy, NEVER invented."""
 
     return LANE_LINES.get(str(lane or "").strip().lower(), GENERIC_LANE_LINE)
 
@@ -205,7 +212,7 @@ def cap_section(name: str, body: str) -> str:
 def current_moment() -> str:
     """The line that lets the session answer "what day is it".
 
-    Built per call, never a module constant: these instructions are assembled
+    Built per call, NEVER a module constant: these instructions are assembled
     once per session but a module-level timestamp would freeze at IMPORT, so a
     long-lived gateway would confidently state the day it booted.
     """
@@ -235,7 +242,7 @@ def build_instructions(
     "dashboard"); anything else ships the generic lane line. ``host_summary``
     is one producer-composed line about the attached host (skill/toolset
     counts), rendered only when provided and capped at HOST_SUMMARY_CAP —
-    ``None`` means nothing renders, never an empty line.
+    ``None`` means nothing renders, NEVER an empty line.
 
     ``capabilities`` is the producer-composed live-catalog section
     (:func:`talk_capabilities.instruction_section`), capped at

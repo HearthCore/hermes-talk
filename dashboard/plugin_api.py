@@ -285,15 +285,18 @@ def _warm_agent_lane() -> str:
     return talk_host.host().agent_lane()
 
 
-def _mint(auth_token: str, voice: str, *, text_output: bool = False):
+def _mint(auth_token: str, voice: str, *, lane: str = "dashboard", text_output: bool = False):
     """Assemble instructions and mint. Blocking — called on a worker thread.
+
+    ``lane`` names the surface (cli, desktop, discord, dashboard); defaults to
+    dashboard for backward compatibility.
 
     ``text_output`` is the cascade lane: the minted session asks the provider
     for TEXT output instead of synthesized audio, and the browser streams the
     text deltas back through the cascade relay to be spoken server-side.
     """
 
-    # The browser owns this lane's microphone, so the pause tool is not
+    # The browser/desktop owns this lane's microphone, so the pause tool is not
     # offered here (default_talk_tools' pausable stays False).
     tools = talk_tools.default_talk_tools()
     return talk_wire.mint_ephemeral_session(
@@ -303,7 +306,7 @@ def _mint(auth_token: str, voice: str, *, text_output: bool = False):
         instructions=talk_identity.build_instructions(
             talk_host.host().identity_sections(),
             tools=tools,
-            lane="dashboard",
+            lane=lane,
             # The session route already paid for the catalog warm, so the
             # live-catalog section reads a warm snapshot here.
             capabilities=talk_capabilities.instruction_section(),
@@ -400,6 +403,7 @@ async def create_session(request: Request) -> dict:
 
     require_dashboard_auth(request)
     body = await _json_body(request)
+    lane = body.get("lane", "dashboard") if isinstance(body.get("lane"), str) else "dashboard"
     voice_mode = _resolve_voice_mode()
     text_output = voice_mode == "cascade"
     if text_output:
@@ -426,6 +430,7 @@ async def create_session(request: Request) -> dict:
             _mint,
             auth.token,
             voice,
+            lane=lane,
             text_output=text_output,
         )
     except talk_wire.TalkWireError as exc:
