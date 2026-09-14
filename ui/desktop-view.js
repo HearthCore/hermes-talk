@@ -92,7 +92,7 @@ export function DesktopTalkView(props) {
             : ready ? desktopTalkSource(status?.source) : 'Talk is not ready on this connection.')),
       active || starting
         ? button(starting ? 'Cancel connection' : 'Stop talking', stopTalk)
-        : button('Start talking', () => void startTalk(),
+        : button('Connect', () => void startTalk(),
           { disabled: !ready || loading || switching || needsToken })),
 
     !active && !starting && ready && !notice && h('p', { className: 'htd-muted' },

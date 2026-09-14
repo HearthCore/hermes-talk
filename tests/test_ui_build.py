@@ -19,6 +19,31 @@ def test_generated_ui_is_current():
     assert BUILDER["build"](ROOT, check=True) == 0
 
 
+def test_presentation_controls_cannot_override_live_state_or_actions():
+    script = PAGE_HARNESS + r"""
+function NativePresentation() {}
+let hidden = 0;
+const hide = () => {hidden++;};
+cursor = 0;
+const tree = Page({presentation: NativePresentation, presentationProps: {
+  open: true, hide, active: true, startTalk: 'not-an-action',
+}});
+assert.equal(tree.tag, NativePresentation);
+assert.equal(tree.props.open, true);
+assert.equal(tree.props.hide, hide);
+assert.equal(tree.props.active, false);
+assert.equal(typeof tree.props.startTalk, 'function');
+assert.equal(requests.length, 0);
+tree.props.hide(); assert.equal(hidden, 1);
+process.exit(0);
+"""
+    completed = run(
+        ["node", "-e", script, str(ROOT / "dashboard/dist/index.js")],
+        cwd=ROOT, capture_output=True, text=True, timeout=NODE_TIMEOUT_S,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 @pytest.mark.parametrize("desktop", [False, True])
 def test_build_is_deterministic_and_check_never_writes(tmp_path, desktop):
     (tmp_path / "ui").mkdir()

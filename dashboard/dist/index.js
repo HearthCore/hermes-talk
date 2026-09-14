@@ -1778,7 +1778,7 @@ function createTalkSurface(SDK) {
       : "Steering unavailable · " + ((steering || {}).reason || "not refreshed");
   }
 
-  function TalkPage({ presentation } = {}) {
+  function TalkPage({ presentation, presentationProps } = {}) {
     const [status, setStatus] = useState(null);
     const [loading, setLoading] = useState(true);
     const [voice, setVoice] = useState("");
@@ -2192,6 +2192,7 @@ function createTalkSurface(SDK) {
     const returnDepth = Number((selection || {}).return_depth || 0);
 
     if (presentation) return h(presentation, {
+      ...presentationProps,
       status, loading, ready, active, starting, live, error, catalogError, needsToken,
       tasks, selectedTask, taskState, transcript, results, typed, sending, switching,
       returnDepth, bound, voice, startTalk, stopTalk, refresh, setTyped, sendTyped,

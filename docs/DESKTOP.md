@@ -1,8 +1,10 @@
 # Hermes Talk in Desktop
 
 The Desktop integration adds **Talk** in the top bar and beside the chat composer.
-Open a conversation, choose **Talk**, then **Start talking**. Talk attaches that
-conversation automatically and shows captions and background results in a compact view.
+Open a conversation, choose **Talk**, then **Connect**. The small popover closes
+automatically once connected so the conversation and dashboard remain usable.
+Talk attaches the current conversation; its status and **Stop** remain beside the
+composer. Reopen Talk whenever you want captions, results or settings.
 The generated entrypoint is `desktop/plugin.js`; it does not embed a second
 provider implementation or an external browser page.
 
@@ -31,10 +33,12 @@ microphone access. This page does not imply those changes are in stock Desktop.
    contribution is disabled. Installed agent packages are opt-in on Desktop.
 4. Open a connected Hermes conversation, then click **Talk** in the top bar or
    beside its composer. The top-bar button follows the focused conversation.
-5. Click **Start talking**. A new conversation is saved automatically, without a
+5. Click **Connect**. A new conversation is saved automatically, without a
    synthetic message. Existing conversations are resumed by their exact identity.
-6. Allow the requested microphone access. Click **Stop talking**, or close the Talk window,
-   to end audio. Accepted background work continues in its owning task.
+6. Allow the requested microphone access. The popover disappears once connected.
+   Clicking away or closing the popover keeps audio running. Click **Stop** beside
+   the composer, or reopen Talk and choose **Stop talking**, to end audio. Accepted
+   background work continues in its owning task.
 
 Local Desktop authentication is automatic. There is no Talk token field or task
 picker to complete before starting. Voice selection, conversation switching and
@@ -71,9 +75,10 @@ connection supplies native Talk authentication.
 ## Ownership and recovery
 
 The host grants one microphone owner across built-in voice and Talk. Talk waits
-for wake-listener suspension before opening audio. Closing, switching the
-composer conversation, changing connection/profile or losing its lease stops the
-transport and releases the microphone.
+for wake-listener suspension before opening audio. Dismissing the popover hides
+only its controls. Stopping Talk, switching the composer conversation, changing
+connection/profile, closing the app or losing the lease stops the transport and
+releases the microphone.
 
 Requests capture the original connection and profile. An already admitted
 request, including a late session receipt and its cleanup request, remains tied

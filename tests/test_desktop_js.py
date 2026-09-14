@@ -180,11 +180,17 @@ def test_opening_talk_cannot_submit_the_composer_draft():
 React.useState=()=>[null,()=>{}];React.useEffect=()=>{};
 React.useRef=value=>({current:value});
 HermesSDK.useComposerVoiceController=()=>controller;
+HermesSDK.Popover='popover';HermesSDK.PopoverTrigger='popover-trigger';
+HermesSDK.PopoverContent='popover-content';
 const tree=context.DesktopTalkAction();
-assert.equal(tree.children[0].props.type,'button');
-tree.children[0].props.onClick();assert.equal(calls.length,0);assert.equal(acquires,0);
+const popover=tree.children[0];
+assert.equal(popover.type,'popover');assert.equal(popover.props.modal,false);
+assert.equal(popover.children[0].children[0].props.type,'button');
+popover.props.onOpenChange(true);assert.equal(calls.length,0);assert.equal(acquires,0);
+const presentation=context.DesktopTalkPresentation({popoverOpen:true,
+  onPopoverOpenChange(){},stopTalk(){}});
 let stopped=0;
-tree.children[1].children[0].props.onSubmit({stopPropagation(){stopped++;}});
+presentation.children[1].props.onSubmit({stopPropagation(){stopped++;}});
 assert.equal(stopped,1,'Talk form submits must stop before the host composer');
 """)
 

@@ -15,9 +15,10 @@
 
 Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
-**Desktop integration:** open a conversation → **Talk** → **Start talking**.
+**Desktop integration:** open a conversation → **Talk** → **Connect**.
 Talk appears in the top bar and beside the composer, selects the current conversation
-and authenticates automatically with the local Desktop backend.
+and authenticates automatically with the local Desktop backend. The small popover
+disappears after connection; Talk status and Stop stay available beside the composer.
 It requires the matching host microphone and request-routing update; installing
 the plugin alone cannot add those host capabilities. See [Desktop setup](docs/DESKTOP.md).
 

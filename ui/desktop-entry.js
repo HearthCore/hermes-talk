@@ -130,14 +130,47 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
   return sdk;
 }
 
-function DesktopTalkPanel({ context, controller, onPreparing }) {
+function DesktopTalkPresentation(props) {
+  const { active, starting, error, needsToken, popoverOpen, onPopoverOpenChange, stopTalk } = props;
+  const previous = React.useRef({ active: false, starting: false, error: '', needsToken: false });
+  React.useEffect(() => {
+    const before = previous.current;
+    previous.current = { active, starting, error, needsToken };
+    const failed = Boolean(error || needsToken);
+    if (failed && (error !== before.error || needsToken !== before.needsToken ||
+        (before.starting && !starting && !active))) {
+      onPopoverOpenChange(true);
+    } else if (active && !before.active) {
+      onPopoverOpenChange(false);
+    }
+  }, [active, starting, error, needsToken, onPopoverOpenChange]);
+
+  return h(React.Fragment, null,
+    (active || starting) && h('span', {
+      style: { display: 'inline-flex', alignItems: 'center', gap: '0.375rem' },
+    },
+    h('span', { role: 'status', 'aria-live': 'polite', style: { fontSize: '0.75rem' } },
+      active ? 'Connected' : 'Connecting…'),
+    h(HermesSDK.Button, {
+      type: 'button', variant: 'ghost', size: 'sm',
+      'aria-label': starting ? 'Cancel Talk connection' : 'Stop talking', onClick: stopTalk,
+    }, starting ? 'Cancel' : 'Stop')),
+    popoverOpen && h(HermesSDK.PopoverContent, {
+      side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+      style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
+        overflowY: 'auto', padding: '1rem' },
+      onSubmit: event => event.stopPropagation(),
+    }, h(DesktopTalkView, props)));
+}
+
+function DesktopTalkPanel({ context, controller, onPreparing, presentationProps }) {
   const controllerRef = React.useRef(controller);
   controllerRef.current = controller;
   const surface = React.useMemo(() => createTalkSurface(
     createDesktopTalkSDK(context, () => controllerRef.current, onPreparing)), [context]);
   return h(React.Fragment, null,
     h('style', null, TALK_CSS),
-    h(surface.TalkPage, { presentation: DesktopTalkView }));
+    h(surface.TalkPage, { presentation: DesktopTalkPresentation, presentationProps }));
 }
 
 export function openFocusedTalk() {
@@ -158,16 +191,24 @@ export function openFocusedTalk() {
 function DesktopTalkAction() {
   const useController = HermesSDK.useComposerVoiceController || (() => null);
   const controller = useController();
-  const [opened, setOpened] = React.useState(null);
+  const [attached, setAttached] = React.useState(null);
+  const [popoverOpen, setPopoverOpen] = React.useState(false);
   const controllerRef = React.useRef(controller);
   controllerRef.current = controller;
   const preparingRef = React.useRef(false);
   const currentOwner = ownerKey(controller?.owner);
   const unavailable = desktopAvailability(controller);
-  const open = opened !== null && (opened.expectedKey === currentOwner || preparingRef.current);
+  const attachedHere = attached !== null &&
+    (attached.expectedKey === currentOwner || preparingRef.current);
   const openPanel = () => {
     const key = ownerKey(controllerRef.current?.owner);
-    setOpened({ initialKey: key, expectedKey: key });
+    setAttached(previous => previous && (previous.expectedKey === key || preparingRef.current)
+      ? previous : { initialKey: key, expectedKey: key });
+    setPopoverOpen(true);
+  };
+  const onPopoverOpenChange = value => {
+    if (value) openPanel();
+    else setPopoverOpen(false);
   };
   React.useEffect(() => {
     const entry = { owner: () => controllerRef.current?.owner, open: openPanel };
@@ -175,38 +216,38 @@ function DesktopTalkAction() {
     return () => desktopOpeners.delete(entry);
   }, []);
   React.useEffect(() => {
-    if (opened && opened.expectedKey !== currentOwner && !preparingRef.current) setOpened(null);
-  }, [currentOwner, opened]);
+    if (attached && attached.expectedKey !== currentOwner && !preparingRef.current) {
+      setAttached(null);
+      setPopoverOpen(false);
+    }
+  }, [currentOwner, attached]);
   const onPreparing = (value, nextOwner) => {
     preparingRef.current = value;
     if (!value) {
       const expectedKey = ownerKey(nextOwner);
-      setOpened(previous => previous && expectedKey === ownerKey(controllerRef.current?.owner)
+      setAttached(previous => previous && expectedKey === ownerKey(controllerRef.current?.owner)
         ? { ...previous, expectedKey } : null);
     }
   };
 
-  return h(React.Fragment, null,
-    h(HermesSDK.Button, {
-      type: 'button', variant: 'ghost', size: 'sm', title: 'Open Hermes Talk',
-      'aria-label': 'Open Hermes Talk',
-      onClick: openPanel,
-    }, 'Talk'),
-    h(HermesSDK.Dialog, {
-      open,
-      onOpenChange: value => value ? openPanel() : setOpened(null),
-    }, h(HermesSDK.DialogContent, {
-      className: 'w-[min(520px,95vw)] max-w-[95vw]',
-      bodyClassName: 'max-h-[80vh] overflow-y-auto',
-      onSubmit: event => event.stopPropagation(),
+  return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '0.25rem' } },
+    h(HermesSDK.Popover, {
+      modal: false, open: popoverOpen && attachedHere, onOpenChange: onPopoverOpenChange,
     },
-    h(HermesSDK.DialogHeader, null,
-      h(HermesSDK.DialogTitle, null, 'Hermes Talk'),
-      h(HermesSDK.DialogDescription, null,
-        'Talk to Hermes in this conversation.')),
-    open && (unavailable || !desktopContext
-      ? h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.')
-      : h(DesktopTalkPanel, { key: opened.initialKey, context: desktopContext, controller, onPreparing })))));
+    h(HermesSDK.PopoverTrigger, { asChild: true },
+      h(HermesSDK.Button, {
+        type: 'button', variant: 'ghost', size: 'sm', title: 'Open Hermes Talk',
+        'aria-label': 'Open Hermes Talk',
+      }, 'Talk')),
+    attachedHere && (unavailable || !desktopContext
+      ? popoverOpen && h(HermesSDK.PopoverContent, {
+        side: 'top', align: 'end', 'aria-label': 'Hermes Talk',
+        style: { width: 'min(360px, calc(100vw - 24px))' },
+      }, h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.'))
+      : h(DesktopTalkPanel, {
+        key: attached.initialKey, context: desktopContext, controller, onPreparing,
+        presentationProps: { popoverOpen, onPopoverOpenChange },
+      }))));
 }
 
 export default {
