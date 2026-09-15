@@ -602,11 +602,189 @@ class CascadeVoice:
                 self._on_audio(pcm)
 
 
+#: OpenAI-compatible TTS request timeout. One REST call per sentence chunk,
+#: so this bounds a single chunk's synthesis rather than a whole response —
+#: generous because a self-hosted model on modest hardware is slower than a
+#: hosted API, and a slow chunk should time out on its own rather than stall
+#: the response indefinitely.
+OPENAI_REQUEST_TIMEOUT_S = 30.0
+
+
+class OpenAICascadeVoice(CascadeVoice):
+    """Speak assistant text deltas through an OpenAI-compatible TTS REST API.
+
+    Same lifecycle, event handling, sentence chunking, and barge-in as
+    :class:`CascadeVoice` — this overrides ONLY the wire transport, from a
+    single stream-input WebSocket per response to one ``POST
+    {base_url}/audio/speech`` call per chunk. ``openai`` here names the
+    WIRE CONTRACT, never a vendor: any endpoint that serves that REST shape
+    qualifies, hosted or self-hosted, reached directly or through a gateway.
+
+    The response body is raw PCM (``response_format="pcm"``, 16-bit LE,
+    24kHz) so it needs no container parsing before it reaches the exact
+    same ``on_audio`` sink the WebSocket lane feeds — the two lanes are
+    interchangeable from the relay's point of view.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        voice: str,
+        model: str,
+        base_url: str,
+        on_audio: Callable[[bytes], None],
+        on_error: Callable[[str], None],
+        on_stream_end: Callable[[], None] | None = None,
+        aiohttp_module: Any = None,
+        request: Callable[..., Any] | None = None,
+        chunk_budget: int = CLAUSE_BUDGET_CHARS,
+        response_format: str = "pcm",
+    ) -> None:
+        # Reuses the base __init__ for everything transport-neutral (queue,
+        # chunker, generation counter, event bookkeeping). ``voice_id`` and
+        # ``model`` build a stream-input URL that this subclass never reads
+        # — harmless string construction, not a network call — kept rather
+        # than duplicating the whole constructor for one unused attribute.
+        super().__init__(
+            api_key=api_key,
+            voice_id=voice,
+            model=model,
+            on_audio=on_audio,
+            on_error=on_error,
+            on_stream_end=on_stream_end,
+            aiohttp_module=aiohttp_module,
+            chunk_budget=chunk_budget,
+        )
+        self._base_url = base_url.rstrip("/")
+        self._voice = voice
+        self._model = model
+        self._response_format = response_format
+        #: Test seam: an async callable (url, headers, json) -> a response-like
+        #: object exposing ``.status`` and ``async .read()``. The real path
+        #: opens an aiohttp session per request.
+        self._request = request
+
+    async def _stream(self, first_chunk: str) -> None:
+        """Speak one response's chunks as sequential REST calls.
+
+        Each chunk is its own complete request/response — no BOS/EOS
+        framing, no persistent socket. Barge-in cancels whichever call is
+        currently in flight (``task.cancel()`` on the wrapping task
+        propagates into the awaited HTTP call) and the generation check
+        before emission drops a chunk that finished decoding just as the
+        operator started talking, exactly like the WebSocket lane.
+        """
+
+        generation = self._generation
+        await self._synthesize_and_emit(first_chunk, generation)
+        while True:
+            item = await self._queue.get()
+            if item is _FLUSH:
+                return
+            await self._synthesize_and_emit(item, generation)
+
+    async def _synthesize_and_emit(self, text: str, generation: int) -> None:
+        pcm = await self._synthesize(text)
+        if pcm and generation == self._generation:
+            self._on_audio(pcm)
+
+    async def _synthesize(self, text: str) -> bytes:
+        """One ``POST /audio/speech`` call; returns the raw PCM body."""
+
+        endpoint = f"{self._base_url}/audio/speech"
+        payload = {
+            "model": self._model,
+            "voice": self._voice,
+            "input": text,
+            "response_format": self._response_format,
+        }
+        if self._request is not None:
+            return await self._request(
+                url=endpoint, headers=self._headers(), json=payload
+            )
+        aiohttp = self._aiohttp or _import_aiohttp()
+        session = aiohttp.ClientSession()
+        try:
+            async with session.post(
+                endpoint,
+                json=payload,
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=OPENAI_REQUEST_TIMEOUT_S),
+            ) as resp:
+                if resp.status != 200:
+                    # The body may carry provider error detail; never surface
+                    # it verbatim (it could echo request material), only the
+                    # status.
+                    raise CascadeTTSError(
+                        f"TTS endpoint returned HTTP {resp.status}"
+                    )
+                return await resp.read()
+        finally:
+            await session.close()
+
+    def _headers(self) -> dict[str, str]:
+        # No key configured (a self-hosted endpoint that needs none) sends
+        # no Authorization header at all, rather than an empty Bearer value.
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
+
+
+def build_cascade_voice(
+    *,
+    tts_provider: str,
+    api_key: str,
+    voice_id: str,
+    model: str,
+    on_audio: Callable[[bytes], None],
+    on_error: Callable[[str], None],
+    on_stream_end: Callable[[], None] | None = None,
+    voice_settings: dict | None = None,
+    base_url: str | None = None,
+) -> CascadeVoice:
+    """Construct the right cascade class for ``tts_provider``. One call site.
+
+    Every cascade-opening lane (terminal, Discord, dashboard) goes through
+    HERE instead of choosing a class itself, so a third TTS provider is one
+    new branch in one place rather than a change repeated at every call
+    site. ``base_url`` is required (and only meaningful) for ``openai``;
+    the WebSocket lane (``elevenlabs``) never reads it.
+    """
+
+    if tts_provider == "openai":
+        if not base_url:
+            raise CascadeTTSError(
+                "build_cascade_voice(tts_provider='openai') needs base_url"
+            )
+        return OpenAICascadeVoice(
+            api_key=api_key,
+            voice=voice_id,
+            model=model,
+            base_url=base_url,
+            on_audio=on_audio,
+            on_error=on_error,
+            on_stream_end=on_stream_end,
+        )
+    return CascadeVoice(
+        api_key=api_key,
+        voice_id=voice_id,
+        model=model,
+        on_audio=on_audio,
+        on_error=on_error,
+        on_stream_end=on_stream_end,
+        voice_settings=voice_settings,
+    )
+
+
 __all__ = [
     "CLAUSE_BUDGET_CHARS",
     "CONNECT_TIMEOUT_S",
+    "OPENAI_REQUEST_TIMEOUT_S",
     "CascadeTTSError",
     "CascadeVoice",
+    "OpenAICascadeVoice",
     "SentenceChunker",
+    "build_cascade_voice",
     "stream_input_url",
 ]

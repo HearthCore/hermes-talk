@@ -1742,13 +1742,24 @@ async def run_talk_session(
     # worker task running.
     cascade = None
     if cascade_config is not None:
-        cascade = talk_cascade_voice.CascadeVoice(
+        cascade_tts_provider = talk_config.cascade_tts()
+        cascade = talk_cascade_voice.build_cascade_voice(
+            tts_provider=cascade_tts_provider,
             api_key=cascade_config[0],
             voice_id=cascade_config[1],
             model=cascade_config[2],
             on_audio=audio.queue_playback,
             on_error=on_error,
-            voice_settings=talk_config.elevenlabs_voice_settings(),
+            voice_settings=(
+                talk_config.elevenlabs_voice_settings()
+                if cascade_tts_provider == "elevenlabs"
+                else None
+            ),
+            base_url=(
+                talk_config.cascade_openai_base_url()
+                if cascade_tts_provider == "openai"
+                else None
+            ),
         )
     session = None
     result = 0
@@ -1854,7 +1865,7 @@ async def run_talk_session(
             f"{controls}\n"
             if cascade_config is None
             else f"talk: connected ({model}, cascade voice {cascade_config[1]} "
-            f"via elevenlabs, auth {auth.source}). {controls}\n"
+            f"via {talk_config.cascade_tts()}, auth {auth.source}). {controls}\n"
         )
 
         async def send_microphone() -> None:

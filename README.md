@@ -374,6 +374,35 @@ call itself survives. `TALK_VOICE_MODE` is fail-closed and defaults to
 a `cascade` check: mode, TTS provider, redacted key presence, voice-id
 status — no live probe.
 
+### OpenAI-compatible cascade TTS — self-hosted or gatewayed
+
+`TALK_CASCADE_TTS=openai` selects the second cascade lane: one `POST
+{base_url}/audio/speech` REST call per sentence chunk, instead of
+ElevenLabs' stream-input socket. `openai` here names the WIRE CONTRACT,
+never a vendor — any endpoint serving that shape qualifies: a self-hosted
+TTS model, or a gateway such as LiteLLM in front of one.
+
+```bash
+TALK_VOICE_MODE=cascade \
+TALK_CASCADE_TTS=openai \
+TALK_CASCADE_OPENAI_BASE_URL=https://your-gateway/v1 \
+TALK_CASCADE_OPENAI_MODEL=your-tts-model \
+TALK_CASCADE_OPENAI_VOICE=your-voice-id \
+hermes talk
+```
+
+The key comes from `TALK_CASCADE_OPENAI_API_KEY`, falling back to
+`TALK_OPENAI_API_KEY`, then `OPENAI_API_KEY` (set-but-blank refuses on
+every one of the three, same rule as every other Talk key); leaving all
+three unset sends no `Authorization` header at all, which many self-hosted
+endpoints expect. The response format is fixed to raw PCM (16-bit LE,
+24kHz) so no container parsing sits between the endpoint and the same
+playback sink the WebSocket lane feeds — the two lanes are interchangeable
+from the relay's point of view, including barge-in (cancels whichever
+request is in flight) and the one-response-degrades-to-text-only failure
+rule. Model and voice ids are backend-defined — this plugin does not know
+or validate the set your endpoint serves.
+
 The cascade speaks on every Talk surface:
 
 | Surface | How the cascade speaks |
@@ -742,10 +771,14 @@ with defaults and failure modes: [docs/OPERATING.md](docs/OPERATING.md#configura
 | `TALK_LIVE_SUBSCRIPTION_MODEL` / `TALK_LIVE_SUBSCRIPTION_VOICE` | `gpt-live-1-codex` / `cove` | Subscription-only Live settings; [validated choices](docs/GPT-LIVE.md#choose-billing-and-voice) |
 | `TALK_LIVE_API_MODEL` / `TALK_LIVE_API_VOICE` | `gpt-live-1` / `marin` | API-only Live settings |
 | `TALK_TASK_API_URL` / `TALK_TASK_TARGET` | unset | Authenticated Hermes dashboard origin and explicit terminal task; [attachment guide](docs/GPT-LIVE.md#start-and-control-a-task) |
-| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider — the only value today; fail-closed |
+| `TALK_CASCADE_TTS` | `elevenlabs` | Cascade TTS provider: `elevenlabs` or `openai` (fail-closed) |
 | `TALK_ELEVENLABS_API_KEY` / `ELEVENLABS_API_KEY` | unset | ElevenLabs key for the cascade lane, Talk-scoped first; set-but-blank refuses; rides the `xi-api-key` header, never the URL |
 | `TALK_ELEVENLABS_VOICE_ID` | unset | Voice the cascade speaks with — **required** in cascade mode (stock or cloned, from your ElevenLabs account) |
 | `TALK_ELEVENLABS_MODEL` | `eleven_flash_v2_5` | ElevenLabs TTS model for the cascade lane |
+| `TALK_CASCADE_OPENAI_BASE_URL` | unset | Base URL of your OpenAI-compatible TTS endpoint — **required** when `TALK_CASCADE_TTS=openai` |
+| `TALK_CASCADE_OPENAI_API_KEY` / `TALK_OPENAI_API_KEY` / `OPENAI_API_KEY` | unset | Key for the OpenAI-compatible cascade lane, in that fallback order; set-but-blank refuses; all unset sends no Authorization header |
+| `TALK_CASCADE_OPENAI_MODEL` | unset | TTS model id your endpoint serves — **required** when `TALK_CASCADE_TTS=openai` |
+| `TALK_CASCADE_OPENAI_VOICE` | unset | Voice/speaker id your endpoint serves — **required** when `TALK_CASCADE_TTS=openai` |
 | `TALK_PREFER_CODEX_OAUTH` | unset | `true` requires Codex OAuth and refuses key fallback; absent/`false` keeps key-first precedence |
 | `TALK_INPUT_DEVICE` / `TALK_OUTPUT_DEVICE` | auto | sounddevice overrides |
 | `TALK_AGENT_PROFILE` | auto-detect | Profile for the detached background agent |

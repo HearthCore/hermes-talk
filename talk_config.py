@@ -56,13 +56,23 @@ GEMINI_LIVE_VOICES = ("Puck", "Charon", "Kore", "Fenrir", "Aoede")
 #: guesses silently would spend the wrong metered TTS key.
 TALK_VOICE_MODES = ("native", "cascade", "live")
 DEFAULT_VOICE_MODE = "native"
-#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. One value
+#: Cascade TTS providers selectable through ``TALK_CASCADE_TTS``. Two values
 #: today; the list exists so a typo refuses instead of silently selecting.
-TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs",)
+#: ``openai`` names the WIRE CONTRACT (the standard ``POST /audio/speech``
+#: shape), never a specific vendor — any OpenAI-compatible TTS endpoint
+#: qualifies, hosted or self-hosted, reached directly or through a gateway
+#: such as LiteLLM. The knob does not know or care which.
+TALK_CASCADE_TTS_PROVIDERS = ("elevenlabs", "openai")
 DEFAULT_CASCADE_TTS = "elevenlabs"
 #: ElevenLabs TTS model for the cascade lane, probed against the live
 #: stream-input endpoint 2026-08-28 (first audio ~490ms, PCM 24kHz out).
 DEFAULT_ELEVENLABS_MODEL = "eleven_flash_v2_5"
+#: OpenAI-compatible cascade lane: one REST call per sentence chunk against
+#: ``POST {base_url}/audio/speech`` — no stream-input socket, no BOS/EOS
+#: framing. ``response_format`` is fixed to ``pcm`` (raw signed 16-bit LE,
+#: 24kHz) so the response body needs no container parsing before it reaches
+#: the same playback sink cascade already feeds.
+DEFAULT_CASCADE_OPENAI_RESPONSE_FORMAT = "pcm"
 #: Delivery pace for the cascade voice. The bounds are the stream-input
 #: ``RealtimeVoiceSettings`` schema's own, not a house rule — that schema
 #: documents "Values range from 0.7 to 1.2, with 1.0 being the default
@@ -748,16 +758,113 @@ def elevenlabs_voice_settings() -> dict:
     return settings
 
 
+def resolve_cascade_openai_key() -> str:
+    """The key for the OpenAI-compatible cascade TTS lane. Fail-closed.
+
+    Order: ``TALK_CASCADE_OPENAI_API_KEY`` (cascade-TTS-scoped) ->
+    ``TALK_OPENAI_API_KEY`` -> ``OPENAI_API_KEY``. Same rule as every other
+    Talk key: set-but-blank is a hard refusal, never a silent fall-through.
+    A self-hosted gateway that requires no key at all (many do not) is
+    reached by leaving every one of these three unset — see
+    :func:`cascade_openai_base_url`, which is what actually requires a value.
+    """
+
+    scoped = os.environ.get("TALK_CASCADE_OPENAI_API_KEY")
+    if scoped is not None:
+        if not scoped.strip():
+            raise TalkConfigError(
+                "TALK_CASCADE_OPENAI_API_KEY is set but empty — set a real "
+                "key or unset it"
+            )
+        return scoped.strip()
+    talk_scoped = os.environ.get("TALK_OPENAI_API_KEY")
+    if talk_scoped is not None:
+        if not talk_scoped.strip():
+            raise TalkConfigError(
+                "TALK_OPENAI_API_KEY is set but empty — set a real key or unset it"
+            )
+        return talk_scoped.strip()
+    shared = os.environ.get("OPENAI_API_KEY")
+    if shared is not None:
+        if not shared.strip():
+            raise TalkConfigError("OPENAI_API_KEY is set but empty — set a real key or unset it")
+        return shared.strip()
+    return ""
+
+
+def cascade_openai_base_url() -> str:
+    """Base URL for the OpenAI-compatible cascade TTS endpoint. REQUIRED.
+
+    No default: unlike the hosted ElevenLabs lane, there is no house
+    endpoint to fall back to — every self-hosted or gateway TTS backend
+    lives at a different address, and guessing one would silently dial a
+    stranger's server. ``/audio/speech`` is appended by the caller; this
+    value is everything before it (e.g. ``https://llm.example.com/v1`` or
+    ``http://localhost:7790/v1``), trailing slash tolerated.
+    """
+
+    raw = (os.environ.get("TALK_CASCADE_OPENAI_BASE_URL") or "").strip()
+    if not raw:
+        raise TalkConfigError(
+            "TALK_CASCADE_TTS=openai needs TALK_CASCADE_OPENAI_BASE_URL — "
+            "set it to your OpenAI-compatible TTS endpoint's base URL "
+            "(e.g. a LiteLLM gateway: https://your-gateway/v1)"
+        )
+    return raw.rstrip("/")
+
+
+def cascade_openai_model() -> str:
+    """TTS model id for the OpenAI-compatible cascade lane. REQUIRED.
+
+    No default: this identifies a specific backend model (e.g. a
+    self-hosted model name behind a gateway), and every deployment names
+    its own. Guessing one would silently target the wrong model rather
+    than refusing with a clear ask.
+    """
+
+    raw = (os.environ.get("TALK_CASCADE_OPENAI_MODEL") or "").strip()
+    if not raw:
+        raise TalkConfigError(
+            "TALK_CASCADE_TTS=openai needs TALK_CASCADE_OPENAI_MODEL — set "
+            "it to the TTS model id your endpoint serves"
+        )
+    return raw
+
+
+def cascade_openai_voice() -> str:
+    """Voice/speaker id for the OpenAI-compatible cascade lane. REQUIRED.
+
+    No default and no fixed enum: backend voices are defined by whatever
+    serves the model (stock OpenAI names on a real OpenAI account, a
+    speaker id on a self-hosted model) and this plugin has no way to know
+    the set in advance. Same required-with-no-guess rule as
+    :func:`elevenlabs_voice_id`.
+    """
+
+    raw = (os.environ.get("TALK_CASCADE_OPENAI_VOICE") or "").strip()
+    if not raw:
+        raise TalkConfigError(
+            "TALK_CASCADE_TTS=openai needs TALK_CASCADE_OPENAI_VOICE — set "
+            "it to a voice/speaker id your endpoint serves"
+        )
+    return raw
+
+
 def cascade_voice_config(provider: str) -> tuple[str, str, str]:
     """The resolved cascade TTS triple — (key, voice id, model). Fail-closed.
 
     Every lane that opens a cascade session resolves through HERE so the
     refusal rules — and their messages — exist exactly once: cascade requires
-    the openai provider (its text-output mode is the only one wired and
-    verified; guessing at grok/gemini text modes would mute the call), the TTS
-    knob validates, the key refuses set-but-blank, and the voice id is
-    required. Callers invoke this only after :func:`voice_mode` returned
-    ``cascade``, before a single secret or socket is spent.
+    the openai REALTIME provider (its text-output mode is the only one wired
+    and verified; guessing at grok/gemini text modes would mute the call),
+    the TTS knob validates, and each TTS provider's own required fields are
+    resolved by its own function. Callers invoke this only after
+    :func:`voice_mode` returned ``cascade``, before a single secret or
+    socket is spent.
+
+    Returned key is ``""`` for the ``openai`` TTS lane when no key is
+    configured (a self-hosted endpoint that needs none) — callers send no
+    Authorization header in that case rather than an empty Bearer value.
     """
 
     if provider != "openai":
@@ -766,11 +873,17 @@ def cascade_voice_config(provider: str) -> tuple[str, str, str]:
             f"'{provider}' is configured — grok/gemini text-output modes are "
             "not wired into the cascade yet"
         )
-    cascade_tts()  # fail-closed; elevenlabs is the only value today
+    tts_provider = cascade_tts()  # fail-closed
+    if tts_provider == "elevenlabs":
+        return (
+            resolve_elevenlabs_key(),
+            elevenlabs_voice_id(),
+            elevenlabs_model(),
+        )
     return (
-        resolve_elevenlabs_key(),
-        elevenlabs_voice_id(),
-        elevenlabs_model(),
+        resolve_cascade_openai_key(),
+        cascade_openai_voice(),
+        cascade_openai_model(),
     )
 
 

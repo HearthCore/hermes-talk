@@ -633,7 +633,7 @@ _PCM_END = object()
 _FEED_DONE = object()
 
 
-def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
+def _resolve_cascade_relay_config() -> tuple[str, str, str, dict, str, str | None]:
     """The cascade config for one relay call — fail-closed, HTTP-shaped.
 
     Delivery settings resolve HERE, beside the key and the voice, so a bad
@@ -645,6 +645,10 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
     ``voiceMode: "cascade"``, so a server no longer in cascade mode means the
     config changed mid-session: a refusal (409), never a guess. A broken
     cascade knob is a 400 carrying the same remediation the CLI would print.
+
+    Returns (api_key, voice_id, model, voice_settings, tts_provider,
+    base_url) — ``voice_settings`` is only meaningful for the ``elevenlabs``
+    lane, ``base_url`` only for ``openai``.
     """
 
     if _resolve_voice_mode() != "cascade":
@@ -656,8 +660,19 @@ def _resolve_cascade_relay_config() -> tuple[str, str, str, dict]:
             ),
         )
     try:
+        tts_provider = talk_config.cascade_tts()
         api_key, voice_id, model = talk_config.cascade_voice_config(talk_config.talk_provider())
-        return (api_key, voice_id, model, talk_config.elevenlabs_voice_settings())
+        base_url = (
+            talk_config.cascade_openai_base_url() if tts_provider == "openai" else None
+        )
+        return (
+            api_key,
+            voice_id,
+            model,
+            talk_config.elevenlabs_voice_settings(),
+            tts_provider,
+            base_url,
+        )
     except talk_config.TalkConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -712,7 +727,9 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
     )
 
 
-async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> AsyncIterator[bytes]:
+async def _cascade_pcm_stream(
+    request, config: tuple[str, str, str, dict, str, str | None]
+) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
     A fresh CascadeVoice per request: one POST == one response's speech. The
@@ -726,8 +743,9 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> As
     """
 
     audio_queue: asyncio.Queue = asyncio.Queue()
-    api_key, voice_id, model, voice_settings = config
-    voice = talk_cascade_voice.CascadeVoice(
+    api_key, voice_id, model, voice_settings, tts_provider, base_url = config
+    voice = talk_cascade_voice.build_cascade_voice(
+        tts_provider=tts_provider,
         api_key=api_key,
         voice_id=voice_id,
         model=model,
@@ -735,6 +753,7 @@ async def _cascade_pcm_stream(request, config: tuple[str, str, str, dict]) -> As
         on_error=lambda text: _log.warning("dashboard cascade relay: %s", text),
         on_stream_end=lambda: audio_queue.put_nowait(_PCM_END),
         voice_settings=voice_settings,
+        base_url=base_url,
     )
     voice.start()
     state = {"completed": False, "speakable": False}

@@ -651,6 +651,60 @@ def _cascade_check() -> dict[str, Any]:
             {"voice_mode": mode, "source": source},
         )
 
+    try:
+        tts_provider = talk_config.cascade_tts()
+    except talk_config.TalkConfigError:
+        raw_tts = (os.environ.get("TALK_CASCADE_TTS") or "").strip().lower() or None
+        return _check(
+            "cascade",
+            "fail",
+            "configured cascade TTS provider is not supported",
+            {"voice_mode": mode, "source": source, "tts": raw_tts},
+            (
+                f"Set TALK_CASCADE_TTS to one of "
+                f"{', '.join(talk_config.TALK_CASCADE_TTS_PROVIDERS)}, or unset it.",
+            ),
+        )
+
+    try:
+        provider = talk_config.talk_provider()
+    except talk_config.TalkConfigError:
+        provider = None  # the provider check already reports that failure
+
+    if tts_provider == "openai":
+        details = _cascade_openai_details(mode, source, tts_provider, provider)
+    else:
+        details = _cascade_elevenlabs_details(mode, source, tts_provider, provider)
+    if details.get("_status") is not None:
+        status, summary, remediation = details.pop("_status")
+        return _check("cascade", status, summary, details, remediation)
+    return _check(
+        "cascade",
+        "pass",
+        f"cascade voice mode is configured (tts {details['tts']}, model {details['model']})",
+        details,
+    )
+
+
+def _cascade_provider_mismatch(
+    details: dict[str, Any], provider: str | None
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """The shared openai-realtime-provider gate both TTS lanes need."""
+
+    if provider is not None and provider != "openai":
+        return (
+            "fail",
+            f"cascade voice mode requires the openai provider, not {provider}",
+            ("Set TALK_PROVIDER=openai for cascade mode, or use TALK_VOICE_MODE=native.",),
+        )
+    return None
+
+
+def _cascade_elevenlabs_details(
+    mode: str, source: str, tts_provider: str, provider: str | None
+) -> dict[str, Any]:
+    """Read-only diagnostic detail for the ElevenLabs cascade lane."""
+
     scoped = os.environ.get("TALK_ELEVENLABS_API_KEY")
     shared = os.environ.get("ELEVENLABS_API_KEY")
     keys = {"scoped": _key_presence(scoped), "shared": _key_presence(shared)}
@@ -659,70 +713,121 @@ def _cascade_check() -> dict[str, Any]:
     details: dict[str, Any] = {
         "voice_mode": mode,
         "source": source,
+        "tts": tts_provider,
         "keys": keys,
         "voice_id": voice_id,
         "model": talk_config.elevenlabs_model(),
+        "provider": provider,
     }
-    try:
-        details["tts"] = talk_config.cascade_tts()
-    except talk_config.TalkConfigError:
-        details["tts"] = (os.environ.get("TALK_CASCADE_TTS") or "").strip().lower() or None
-        return _check(
-            "cascade",
-            "fail",
-            "configured cascade TTS provider is not supported",
-            details,
-            ("Set TALK_CASCADE_TTS to elevenlabs, or unset it.",),
-        )
-    try:
-        provider = talk_config.talk_provider()
-    except talk_config.TalkConfigError:
-        provider = None  # the provider check already reports that failure
-    details["provider"] = provider
-    if provider is not None and provider != "openai":
-        return _check(
-            "cascade",
-            "fail",
-            f"cascade voice mode requires the openai provider, not {provider}",
-            details,
-            ("Set TALK_PROVIDER=openai for cascade mode, or use TALK_VOICE_MODE=native.",),
-        )
+    mismatch = _cascade_provider_mismatch(details, provider)
+    if mismatch is not None:
+        details["_status"] = mismatch
+        return details
     if keys["scoped"] == "blank" or (scoped is None and keys["shared"] == "blank"):
-        return _check(
-            "cascade",
+        details["_status"] = (
             "fail",
             "an ElevenLabs key variable is set but blank and refuses closed",
-            details,
             (
                 "Set a real key in TALK_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY, "
                 "or unset the blank one.",
             ),
         )
+        return details
     if "present" not in keys.values():
-        return _check(
-            "cascade",
+        details["_status"] = (
             "fail",
             "cascade voice mode is selected but no ElevenLabs key is configured",
-            details,
             ("Set TALK_ELEVENLABS_API_KEY or ELEVENLABS_API_KEY.",),
         )
+        return details
     if voice_id is None:
-        return _check(
-            "cascade",
+        details["_status"] = (
             "fail",
             "cascade voice mode needs a voice id and none is configured",
-            details,
             (
                 "Set TALK_ELEVENLABS_VOICE_ID to a voice id from your ElevenLabs "
                 "account (VoiceLab -> your voice -> ID).",
             ),
         )
-    return _check(
-        "cascade",
-        "pass",
-        f"cascade voice mode is configured (tts {details['tts']}, model {details['model']})",
-        details,
-    )
+        return details
+    details["_status"] = None
+    return details
+
+
+def _cascade_openai_details(
+    mode: str, source: str, tts_provider: str, provider: str | None
+) -> dict[str, Any]:
+    """Read-only diagnostic detail for the OpenAI-compatible cascade lane.
+
+    Same presence-only, no-live-probe contract as the ElevenLabs check: the
+    base URL is reported in full (it is an endpoint address, not a secret),
+    the key's PRESENCE only, and no request ever leaves this process.
+    """
+
+    scoped = os.environ.get("TALK_CASCADE_OPENAI_API_KEY")
+    talk_scoped = os.environ.get("TALK_OPENAI_API_KEY")
+    shared = os.environ.get("OPENAI_API_KEY")
+    keys = {
+        "scoped": _key_presence(scoped),
+        "talk_scoped": _key_presence(talk_scoped),
+        "shared": _key_presence(shared),
+    }
+    base_url_raw = os.environ.get("TALK_CASCADE_OPENAI_BASE_URL")
+    base_url = (base_url_raw or "").strip() or None
+    model_raw = os.environ.get("TALK_CASCADE_OPENAI_MODEL")
+    model = (model_raw or "").strip() or None
+    voice_raw = os.environ.get("TALK_CASCADE_OPENAI_VOICE")
+    voice_id = (voice_raw or "").strip() or None
+    details: dict[str, Any] = {
+        "voice_mode": mode,
+        "source": source,
+        "tts": tts_provider,
+        "keys": keys,
+        "base_url": base_url,
+        "voice_id": voice_id,
+        "model": model,
+        "provider": provider,
+    }
+    mismatch = _cascade_provider_mismatch(details, provider)
+    if mismatch is not None:
+        details["_status"] = mismatch
+        return details
+    if scoped == "" or talk_scoped == "" or shared == "":
+        details["_status"] = (
+            "fail",
+            "an OpenAI-compatible cascade key variable is set but blank and refuses closed",
+            (
+                "Set a real key in TALK_CASCADE_OPENAI_API_KEY, TALK_OPENAI_API_KEY, "
+                "or OPENAI_API_KEY, or unset the blank one.",
+            ),
+        )
+        return details
+    if base_url is None:
+        details["_status"] = (
+            "fail",
+            "cascade voice mode (openai) needs a base URL and none is configured",
+            (
+                "Set TALK_CASCADE_OPENAI_BASE_URL to your OpenAI-compatible TTS "
+                "endpoint's base URL (e.g. a LiteLLM gateway: https://your-gateway/v1).",
+            ),
+        )
+        return details
+    if model is None:
+        details["_status"] = (
+            "fail",
+            "cascade voice mode (openai) needs a model id and none is configured",
+            ("Set TALK_CASCADE_OPENAI_MODEL to the TTS model id your endpoint serves.",),
+        )
+        return details
+    if voice_id is None:
+        details["_status"] = (
+            "fail",
+            "cascade voice mode (openai) needs a voice id and none is configured",
+            ("Set TALK_CASCADE_OPENAI_VOICE to a voice/speaker id your endpoint serves.",),
+        )
+        return details
+    details["_status"] = None
+    return details
 
 
 def _audio_check() -> dict[str, Any]:
