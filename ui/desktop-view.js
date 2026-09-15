@@ -61,12 +61,15 @@ function desktopTalkSource(source) {
   return 'Hermes voice';
 }
 
-function desktopTalkLiveLabel(live) {
+function desktopTalkLiveLabel(live, audioActivity) {
+  if (audioActivity?.output === true) return 'Audio playing';
+  if (audioActivity?.input === true) return 'Microphone audio detected';
   if (/^Thinking|^Processing/i.test(live)) return 'Thinking…';
   if (/^Using /i.test(live)) return 'Hermes is working on your request.';
   if (/checking the request/i.test(live)) return 'Hermes is checking your request.';
   if (/returned a task decision/i.test(live)) return 'Hermes returned an update.';
-  return 'Listening…';
+  if (/^Listening/i.test(live)) return 'Listening…';
+  return 'Connected';
 }
 
 function desktopTalkJobLabel(status) {
@@ -121,6 +124,7 @@ export function DesktopTalkView(props) {
   const button = (label, onClick, options = {}) => h(HermesSDK.Button,
     { ...options, type: 'button', onClick }, label);
   const busy = starting || switching;
+  const inputOperations = props.inputCapabilities?.operations || [];
   const recipients = (props.recipients || []).filter(row => typeof row?.recipient_id === 'string');
   const recipient = recipients.find(row => row.recipient_id === selectedRecipient);
   const matchingRecipients = recipients.filter(row => desktopTalkRecipientLabel(row).toLowerCase()
@@ -132,11 +136,11 @@ export function DesktopTalkView(props) {
   const messageable = !selectedRecipient || (recipientAvailable && !recipient.read_only &&
     recipient.send_agent_message === 'direct' && recipient.proven_control !== 'none');
   const selectedJob = allJobs.find(job => job.run_id === props.selectedJob);
-  const steerable = selectedJob?.steering?.supported === true ||
+  const steerable = inputOperations.includes('steer') && (selectedJob?.steering?.supported === true ||
     (recipientAvailable && recipient.app === 'codex_worker' && !recipient.read_only &&
-      recipient.operations?.includes('steer_work'));
+      recipient.operations?.includes('steer_work')));
   const operationAvailable = ({ read: readable, message: messageable,
-    start_worker: props.inputCapabilities?.operations?.includes('start_worker'), steer: steerable
+    start_worker: inputOperations.includes('start_worker'), steer: steerable
   })[recipientOperation] === true;
   const sendDisabled = !canSendTyped || !operationAvailable || recipientOperation === 'read' ||
     sending || busy || (!typed.trim() && !attachments.length) ||
@@ -163,8 +167,9 @@ export function DesktopTalkView(props) {
         h('p', { className: 'htd-muted', role: 'status' },
           h('span', { className: 'htd-status', 'aria-hidden': true }),
           loading ? 'Checking connection…' : starting ? 'Connecting…'
-            : sleeping ? 'Sleeping · microphone off' : muted ? 'Microphone muted'
-            : active ? desktopTalkSource(status?.source) + ' · ' + desktopTalkLiveLabel(live)
+            : sleeping ? 'Sleeping · microphone off' : muted ? 'Microphone muted' +
+              (active && props.audioActivity?.output === true ? ' · Audio playing' : '')
+            : active ? desktopTalkSource(status?.source) + ' · ' + desktopTalkLiveLabel(live, props.audioActivity)
             : ready ? desktopTalkSource(status?.source) : 'Talk is not ready on this connection.')),
       h('div', { className: 'htd-controls' }, active || starting
         ? button(starting ? 'Cancel connection' : 'Stop talking', stopTalk)
@@ -233,7 +238,7 @@ export function DesktopTalkView(props) {
         'aria-label': 'Recipient action', onChange: event => setRecipientOperation(event.target.value) },
       h('option', { value: 'read', disabled: !readable }, 'Read conversation'),
       h('option', { value: 'message', disabled: !messageable }, 'Message existing task'),
-      h('option', { value: 'start_worker', disabled: !props.inputCapabilities?.operations?.includes('start_worker') },
+      h('option', { value: 'start_worker', disabled: !inputOperations.includes('start_worker') },
         'Start a new worker'),
       h('option', { value: 'steer', disabled: !steerable }, 'Steer owned job'))),
     recipientOperation === 'steer' && selectedJob && h('p', { className: 'htd-text' },
@@ -320,12 +325,17 @@ export function DesktopTalkView(props) {
         presentation && h('p', { className: 'htd-muted' }, desktopTalkPresentationLabel(presentation)),
         h('div', { className: 'htd-controls' },
           !terminal && steerJob && button('Steer owned job', () => steerJob(job.run_id),
-            { variant: 'outline', size: 'sm', disabled: job.steering?.supported !== true || sending || busy }),
+            { variant: 'outline', size: 'sm', disabled: !inputOperations.includes('steer') ||
+              job.steering?.supported !== true || sending || busy }),
           !terminal && cancelJob && button('Cancel job', () => void cancelJob(job.run_id),
-            { variant: 'outline', size: 'sm', disabled: !!pendingActions['cancel:' + job.run_id]?.pending || busy }),
+            { variant: 'outline', size: 'sm', disabled: !inputOperations.includes('cancel') ||
+              !!pendingActions['cancel:' + job.run_id]?.pending || busy }),
           presentation?.replay_eligible && replayResult && button('Replay summary',
             () => void replayResult(presentation.event_id), { variant: 'outline', size: 'sm',
-              disabled: !active || sleeping || busy || !!pendingActions['replay:' + presentation.event_id]?.pending })),
+              disabled: props.replaySupported === false || !active || sleeping || busy ||
+                !!pendingActions['replay:' + presentation.event_id]?.pending })),
+        terminal && presentation?.replay_eligible && props.replaySupported === false &&
+          h('p', { className: 'htd-muted' }, 'Summary replay is unavailable on this connection.'),
         (job.approval?.approvals || []).slice(0, 4).map(approval =>
           h('section', { className: 'htd-stack htd-notice', key: approval.request_id,
             'aria-label': 'Pending approval' },
@@ -338,11 +348,12 @@ export function DesktopTalkView(props) {
                   always: 'Always allow', deny: 'Deny' })[choice], () => void answerApproval({
                     run_id: job.run_id, action_id: job.action_id, request_id: approval.request_id, choice
                   }), { key: choice, variant: 'outline', size: 'sm',
-                    disabled: !answerApproval || job.approval.actionable !== true || busy ||
+                    disabled: !answerApproval || !inputOperations.includes('approval') ||
+                      job.approval.actionable !== true || busy ||
                       !!pendingActions['approval:' + approval.request_id]?.pending }))),
             pendingActions['approval:' + approval.request_id]?.pending &&
               h('p', { role: 'status', className: 'htd-muted' }, 'Submitting approval…'),
-            job.approval.actionable !== true && h('p', { className: 'htd-muted' },
+            (job.approval.actionable !== true || !inputOperations.includes('approval')) && h('p', { className: 'htd-muted' },
               'Approval controls are unavailable for this request.'),
             actionError('approval:' + approval.request_id, 'The approval could not be submitted. Try again.'))),
         job.result_available && !props.results?.[job.run_id] && h('div', null,

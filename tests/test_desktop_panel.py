@@ -22,7 +22,7 @@ const writable = {recipient_id:'live-a',app:'claude_code',task_id:'task-c',host_
 let props = {status:{source:'subscription'},ready:true,active:false,voiceOwner:owner,
   tasks:[{target_id:'owner',label:'Owner task'}],selectedTask:'owner',typed:'',attachments:[],
   recipients:[readOnly,writable],selectedRecipient:'',recipientOperation:'message',
-  canSendTyped:true,inputCapabilities:{operations:['message','start_worker']},
+  canSendTyped:true,inputCapabilities:{operations:['message','start_worker','cancel','steer','approval']},
   setTyped(value){props.typed=value;calls.push(['draft',value]);},
   setRecipient(value){props.selectedRecipient=value;calls.push(['recipient',value]);},
   setRecipientQuery(value){props.recipientQuery=value;},
@@ -308,4 +308,44 @@ const resultView=byLabel(tree,'Task results');
 assert(text(resultView).includes('Output 0'));
 assert(text(resultView).includes('Visible oldest job'));
 assert.equal(nodes(resultView).filter(node=>node.type==='article').length,8);
+""")
+
+
+def test_job_controls_require_connection_capabilities_and_replay_support():
+    run_panel(r"""
+const job={run_id:8,action_id:'action-a',status:'running',steering:{supported:true},
+  approval:{actionable:true,approvals:[{request_id:'request-a',choices:['once','deny']}]}};
+const result={run_id:9,action_id:'action-b',status:'completed',result_available:true,
+  presentation:{event_id:'result-a',state:'unknown',replay_eligible:true}};
+let tree=render({active:true,selectedJob:8,recipientOperation:'steer',typed:'Correction',
+  inputCapabilities:{operations:[]},replaySupported:false,taskState:{jobs:[job,result]},
+  cancelJob(){},steerJob(){},answerApproval(){},replayResult(){}});
+for(const label of ['Cancel job','Steer owned job','Allow once','Deny','Replay summary','Send'])
+  assert.equal(button(tree,label).props.disabled,true,label+' must be unavailable');
+assert(text(tree).includes('Summary replay is unavailable on this connection.'));
+assert(text(tree).includes('Approval controls are unavailable for this request.'));
+tree=render({inputCapabilities:{operations:['cancel','steer','approval']},replaySupported:true});
+for(const label of ['Cancel job','Steer owned job','Allow once','Deny','Replay summary','Send'])
+  assert.equal(Boolean(button(tree,label).props.disabled),false,label+' must be available');
+assert(!text(tree).includes('Summary replay is unavailable on this connection.'));
+""")
+
+
+def test_audio_status_uses_measured_output_and_preserves_unknown_states():
+    run_panel(r"""
+function statusText(tree) {return text(nodes(tree).find(node=>node.props?.role==='status'));}
+let tree=render({active:true,live:'Unknown transport observation'});
+assert(statusText(tree).includes('Connected'));assert(!statusText(tree).includes('Listening'));
+tree=render({live:'Listening…'});assert(statusText(tree).includes('Listening…'));
+tree=render({live:'Thinking…'});assert(statusText(tree).includes('Thinking…'));
+tree=render({audioActivity:{output:true}});assert(statusText(tree).includes('Audio playing'));
+assert(!statusText(tree).includes('Thinking'));assert(!statusText(tree).includes('heard'));
+tree=render({muted:true});assert(statusText(tree).includes('Microphone muted'));
+assert(statusText(tree).includes('Audio playing'));
+tree=render({audioActivity:{output:false},live:'Listening…'});
+assert(!statusText(tree).includes('Listening'));assert(!statusText(tree).includes('Audio playing'));
+tree=render({muted:false,audioActivity:{input:true}});
+assert(statusText(tree).includes('Microphone audio detected'));
+tree=render({sleeping:true,audioActivity:{output:true}});
+assert(statusText(tree).includes('Sleeping'));assert(!statusText(tree).includes('Audio playing'));
 """)
