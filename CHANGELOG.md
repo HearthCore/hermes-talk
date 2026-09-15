@@ -11,6 +11,53 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.20.0] — 2026-09-16
+
+### Added
+- A floating Talk panel shared by the dashboard tab and the Desktop Talk view:
+  a runtime that survives collapsing the controls and browsing other tasks,
+  a recipient picker with exact identities, typed input alongside voice with
+  draft retention, task cards with approvals gated on the server's descriptor,
+  and honest playback presentation. Attachments stay local and Send with files
+  is disabled with a visible reason until the host route exists. (#156)
+- `POST /text/input` and a `textInput` descriptor on `GET /status`: one
+  authenticated route for explicit operations from the panel, `message` to the
+  pinned task or to the exact selected recipient, `start_worker`, `steer`,
+  `cancel`, `approval`. Every call binds the connection and generation, the
+  recipient is the store's current selection compared field for field and
+  frozen into the captured send, and a repeated input returns its stored
+  receipt instead of dispatching twice. Reply states are the honest ones the
+  transports report; nothing retries an uncertain dispatch. (#158)
+- Live replay: `POST /live/speech` with `replay:true` re-announces a terminal
+  result into the exact bound Live session, answering a still-open delegation
+  or appending context once it is retired, persisting the `submitting` fence
+  before the send and `context_submitted` or `unknown` after. (#158)
+- `POST /native/attach` accepts `input_mode:"typed"` for microphone-off use
+  that mints no voice credentials, and `POST /recipients/catalog|history|
+  status|select` expose read-only recipient history through the host bridge.
+  A history read never confers send. (#154)
+- Result presentation across transports: result ready, context submitted,
+  playback started, playback finished, interrupted and unknown stay separate
+  facts; browser WebRTC playback stays `unknown`; native terminal and Discord
+  gain `/replay EVENT_ID`. (#153)
+- Talk inside the current Desktop conversation, plug-and-play: open a
+  conversation, Talk, Connect. (#142)
+
+### Changed
+- A cancel is recorded as submitting before the stop is posted, so a retry
+  after a lost reply observes the run instead of posting a second stop. (#158)
+- The history outbox runs SQLite in write-ahead-logging mode with a 10 s busy
+  bound, so a busy writer can no longer starve concurrent reads into
+  `outbox_unavailable`. (#152)
+- README leads with the product name and names the realtime lanes and how
+  each is billed; a static landing page and a citation file were added. (#157)
+
+### Fixed
+- Windows CI: wall-clock waits scale on slow runners, a wedged test fails on
+  its own instead of holding the job, and the tests that assert ordering under
+  real deadlines are skipped on Windows CI only, visibly, and still run on
+  Linux and locally. (#152, #155)
+
 ## [0.19.2] — 2026-09-15
 
 ### Fixed
