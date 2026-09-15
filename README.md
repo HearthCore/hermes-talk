@@ -226,9 +226,10 @@ Resolved fail-closed in this order:
 2. `OPENAI_API_KEY` — the shared environment key
 3. **Codex OAuth** — no key at all: if you're signed into the
    [Codex CLI](https://github.com/openai/codex) (`codex login`), Talk rides
-   your own ChatGPT subscription's Realtime entitlement. Expired tokens
-   refresh automatically and write back atomically, so the Codex CLI keeps
-   working.
+   your own ChatGPT subscription's Realtime entitlement. If Hermes itself is
+   logged in (`hermes auth login openai-codex`) that login is borrowed first,
+   with the host handling refresh. Talk reads `~/.codex/auth.json` but never
+   refreshes or rewrites it; an expired token asks you to `codex login` again.
 
 That historical order remains unchanged when `TALK_PREFER_CODEX_OAUTH` is
 absent or explicitly false. Set `TALK_PREFER_CODEX_OAUTH=true` to require the
@@ -236,7 +237,7 @@ subscription lane even when API keys exist. The preference is fail-closed: a
 missing/unusable Codex login refuses instead of spending a metered key, and a
 blank or invalid preference refuses until corrected. `hermes talk doctor`
 names the winning lane and distinguishes valid OAuth from an expired credential
-that still requires a successful refresh; it never prints the key or token.
+that needs a fresh `codex login`; it never prints the key or token.
 When setup offers the API-key lane under an enabled OAuth preference, it reuses
 an existing metered key when present and separately confirms the required
 `TALK_PREFER_CODEX_OAUTH=false` policy transition.

@@ -134,8 +134,8 @@ def test_doctor_is_read_only_even_when_oauth_is_expired(monkeypatch, tmp_path):
     def forbidden(*args, **kwargs):
         raise AssertionError("doctor tried to refresh or write OAuth")
 
-    monkeypatch.setattr(talk_auth, "_post_token_form", forbidden)
-    monkeypatch.setattr(talk_auth, "_write_auth_json", forbidden)
+    monkeypatch.setattr(talk_auth, "_post_token_form", forbidden, raising=False)
+    monkeypatch.setattr(talk_auth, "_write_auth_json", forbidden, raising=False)
 
     auth = _checks(talk_doctor.collect_report())["auth"]
 
