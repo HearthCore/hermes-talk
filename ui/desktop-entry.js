@@ -36,10 +36,13 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
     hooks: React,
     components: { Button: HermesSDK.Button, Input: HermesSDK.Input },
     managedAuthentication: true,
+    get lifetimeSignal() { return currentController()?.signal; },
     get desktopOwner() { return owner; },
+    stopHost() { currentController()?.stop?.(); },
     async prepareTask({ tabId, signal }) {
       const current = currentController();
       const original = owner;
+      if (current?.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
       if (ownerKey(current?.owner) !== ownerKey(original) || signal?.aborted) {
         throw new Error('The Hermes conversation changed. Reopen Talk in the selected conversation.');
       }
@@ -50,16 +53,17 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
       onPreparing(true);
       try {
         prepared = await current.prepareSession();
-        if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
+        if (signal?.aborted || current.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
         if (!prepared?.storedSessionId || prepared.connectionId !== scope.connectionId ||
             prepared.profile !== scope.profile || (original.storedSessionId &&
-              prepared.storedSessionId !== original.storedSessionId)) {
+              prepared.storedSessionId !== original.storedSessionId) ||
+            (current.signal && ownerKey(prepared) !== ownerKey(original))) {
           throw new Error('The Hermes conversation changed. Reopen Talk in the selected conversation.');
         }
         // React must publish the prepared owner before its current lease can be used.
         const deadline = Date.now() + 1000;
         while (ownerKey(currentController()?.owner) !== ownerKey(prepared) && Date.now() < deadline) {
-          if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
+          if (signal?.aborted || current.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
           await new Promise(resolve => window.setTimeout(resolve, 10));
         }
         if (ownerKey(currentController()?.owner) !== ownerKey(prepared)) {
@@ -91,6 +95,7 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
     },
     async acquireMicrophone({ signal } = {}) {
       const current = currentController();
+      if (signal?.aborted || current?.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
       if (desktopAvailability(current) || ownerKey(current.owner) !== ownerKey(owner)) {
         throw new Error('The Hermes conversation changed. Reopen Talk in the selected conversation.');
       }
@@ -98,6 +103,11 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
       if (!lease || typeof lease.release !== 'function' || !lease.signal) {
         lease?.release?.();
         throw new Error('Hermes could not grant microphone ownership. Stop its other voice session first.');
+      }
+      if (signal?.aborted || current.signal?.aborted || lease.signal.aborted ||
+          ownerKey(currentController()?.owner) !== ownerKey(owner)) {
+        lease.release();
+        throw new DOMException('Request cancelled', 'AbortError');
       }
       return lease;
     },
@@ -120,10 +130,10 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         });
       } catch (error) {
         const prefix = "Error invoking remote method 'hermes:api': Error: ";
-        if (typeof error?.message === 'string' && error.message.startsWith(prefix)) {
-          throw new Error(error.message.slice(prefix.length));
-        }
-        throw error;
+        const normalized = typeof error?.message === 'string' && error.message.startsWith(prefix)
+          ? new Error(error.message.slice(prefix.length)) : error;
+        if (/^(?:401|403)\b/.test(normalized?.message || '')) sdk.stopHost();
+        throw normalized;
       }
     },
   };
@@ -160,7 +170,132 @@ function DesktopTalkPresentation(props) {
       style: { width: 'min(360px, calc(100vw - 24px))', maxHeight: '70vh',
         overflowY: 'auto', padding: '1rem' },
       onSubmit: event => event.stopPropagation(),
-    }, h(DesktopTalkView, props)));
+    }, h('p', { role: 'status', style: { fontSize: '.75rem', marginBottom: '.75rem' } },
+      'Composer mode · update Hermes Desktop for a persistent floating Talk window.'),
+    h(DesktopTalkView, props)));
+}
+
+const TALK_HUD_CSS = `
+.ht-hud { display:grid; gap:.5rem; color:inherit; font:inherit; }
+.ht-hud-compact { position:relative; display:flex; align-items:center; gap:.5rem; }
+.ht-hud-toggle { min-width:3rem; min-height:3rem; border-radius:50%; font:inherit; color:inherit; background:inherit; border:1px solid currentColor; cursor:pointer; }
+.ht-hud-toggle:focus-visible { outline:2px solid currentColor; outline-offset:3px; }
+.ht-hud-preview { display:none; margin:0; font-size:.75rem; overflow-wrap:anywhere; }
+.ht-hud-compact:hover .ht-hud-preview, .ht-hud-compact:focus-within .ht-hud-preview { display:block; }
+.ht-hud-panel { width:min(380px,calc(100vw - 24px)); max-height:calc(100vh - 5rem); overflow:auto; padding:.75rem; }
+.ht-hud[data-skin="contrast"] { color:CanvasText; background:Canvas; }
+.ht-hud[data-animate="true"][data-active="true"] .ht-hud-toggle { animation:ht-hud-connected 2s ease-in-out infinite; }
+@keyframes ht-hud-connected { 50% { border-color:transparent; } }
+@media (prefers-reduced-motion:reduce) { .ht-hud-toggle { animation:none !important; } }
+`;
+
+function TalkHudPresentation(props) {
+  const { active, starting, muted, sleeping, taskState, selectedRecipient, recipients = [],
+    expanded, setExpanded, appearance = {} } = props;
+  const toggleRef = React.useRef(null);
+  const recipient = recipients.find(row => row.recipient_id === selectedRecipient);
+  const addressed = recipient ? desktopTalkRecipientLabel(recipient)
+    : selectedRecipient ? 'Unavailable recipient · ' + selectedRecipient : 'Hermes · voice owner';
+  const activeWork = (taskState?.jobs || []).filter(job =>
+    ['queued', 'pending', 'accepted', 'running', 'waiting_approval', 'waiting_for_approval',
+      'approval_required', 'paused'].includes(job.status)).length;
+  const state = starting ? 'Connecting…' : sleeping ? 'Sleeping · microphone off'
+    : muted && active ? 'Microphone muted' : active ? 'Connected · microphone on' : 'Microphone off';
+  const status = state + ' · Addressed: ' + addressed + ' · Active work: ' + activeWork;
+  const collapse = () => { setExpanded(false); toggleRef.current?.focus(); };
+  return h('section', { className: 'ht-hud', 'aria-label': 'Hermes Talk floating control',
+    'data-skin': appearance.skin || 'system', 'data-animate': String(appearance.animate === true),
+    'data-active': String(Boolean(active && !muted && !sleeping)),
+    onKeyDown: event => {
+      if (event.key === 'Escape' && expanded) { event.preventDefault(); collapse(); }
+    } },
+    h('style', null, TALK_HUD_CSS),
+    h('div', { className: 'ht-hud-compact' },
+      h('button', { type: 'button', className: 'ht-hud-toggle', ref: toggleRef,
+        'aria-label': (expanded ? 'Collapse Talk' : 'Expand Talk') + ' · ' + status,
+        'aria-expanded': expanded, 'aria-controls': 'hermes-talk-hud-panel',
+        'aria-describedby': 'hermes-talk-hud-status', onClick: () => setExpanded(!expanded) }, 'Talk'),
+      h('p', { id: 'hermes-talk-hud-status', className: 'ht-hud-preview', role: 'status' }, status)),
+    expanded && h('div', { id: 'hermes-talk-hud-panel', className: 'ht-hud-panel',
+      onSubmit: event => event.stopPropagation() }, h(DesktopTalkView, { ...props, collapse })));
+}
+
+function TalkHudRuntime({ context, controller }) {
+  const controllerRef = React.useRef(controller);
+  const pinnedOwner = React.useRef(ownerKey(controller.owner));
+  const [expanded, setExpanded] = React.useState(true);
+  controllerRef.current = controller;
+  const surface = React.useMemo(() => createTalkSurface(
+    createDesktopTalkSDK(context, () => controllerRef.current)), [context]);
+  React.useEffect(() => {
+    if (ownerKey(controller.owner) !== pinnedOwner.current) controller.stop();
+  }, [controller]);
+  return h(React.Fragment, null, h('style', null, TALK_CSS),
+    h(surface.TalkPage, { presentation: TalkHudPresentation,
+      presentationProps: { expanded, setExpanded } }));
+}
+
+function persistentTalkAvailable(context) {
+  return context?.voice?.available === true && typeof context.voice.open === 'function' &&
+    typeof context.voice.register === 'function';
+}
+
+function DesktopTalkLauncher() {
+  const useController = HermesSDK.useComposerVoiceController || (() => null);
+  const controller = useController();
+  const controllerRef = React.useRef(controller);
+  controllerRef.current = controller;
+  const pendingRef = React.useRef(false);
+  const mountedRef = React.useRef(true);
+  const [opening, setOpening] = React.useState(false);
+  const [error, setError] = React.useState('');
+  const unavailable = desktopAvailability(controller);
+  const open = async () => {
+    const current = controllerRef.current;
+    if (pendingRef.current || desktopAvailability(current) || !persistentTalkAvailable(desktopContext)) return;
+    const owner = { ...current.owner };
+    const context = desktopContext;
+    pendingRef.current = true;
+    setOpening(true);
+    setError('');
+    try {
+      const prepared = await current.prepareSession();
+      if (!prepared || ['connectionId', 'profile', 'sessionId', 'storedSessionId']
+        .some(key => typeof prepared[key] !== 'string' || !prepared[key]) ||
+          prepared.connectionId !== owner.connectionId || prepared.profile !== owner.profile ||
+          (owner.storedSessionId && prepared.storedSessionId !== owner.storedSessionId)) {
+        throw new Error('The Hermes conversation changed.');
+      }
+      const deadline = Date.now() + 1000;
+      while (mountedRef.current && ownerKey(controllerRef.current?.owner) !== ownerKey(prepared) &&
+          Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 10));
+      }
+      if (!mountedRef.current || ownerKey(controllerRef.current?.owner) !== ownerKey(prepared) ||
+          context !== desktopContext) {
+        throw new Error('The Hermes conversation changed.');
+      }
+      await context.voice.open(Object.freeze({ ...prepared }));
+    } catch (_) {
+      if (mountedRef.current) {
+        setError('Talk could not open. Stop any other floating voice session, then reopen this conversation and try again.');
+      }
+    } finally {
+      pendingRef.current = false;
+      if (mountedRef.current) setOpening(false);
+    }
+  };
+  React.useEffect(() => {
+    mountedRef.current = true;
+    const entry = { owner: () => controllerRef.current?.owner, open };
+    desktopOpeners.add(entry);
+    return () => { mountedRef.current = false; desktopOpeners.delete(entry); };
+  }, []);
+  return h('span', { style: { display: 'inline-flex', alignItems: 'center', gap: '.5rem' } },
+    h(HermesSDK.Button, { type: 'button', variant: 'ghost', size: 'sm', disabled: opening || !!unavailable,
+      title: unavailable || 'Open the floating Talk window. Audio stays off until Connect.',
+      'aria-label': 'Open floating Hermes Talk', onClick: () => void open() }, opening ? 'Opening…' : 'Talk'),
+    error && h('span', { role: 'alert', style: { fontSize: '.75rem' } }, error));
 }
 
 function DesktopTalkPanel({ context, controller, onPreparing, presentationProps }) {
@@ -182,13 +317,14 @@ export function openFocusedTalk() {
     const candidate = entry.owner();
     return focused && candidate?.connectionId === focused.connectionId &&
       candidate?.profile === focused.profile && (candidate?.storedSessionId || null) === stored &&
-      (stored || (candidate?.sessionId || null) === runtime);
+      (candidate?.sessionId || null) === runtime;
   });
   if (matches.length === 1) matches[0].open();
   else HermesSDK.host?.notify('Open a connected conversation, then choose Talk beside its message box.');
 }
 
 function DesktopTalkAction() {
+  if (persistentTalkAvailable(desktopContext)) return h(DesktopTalkLauncher);
   const useController = HermesSDK.useComposerVoiceController || (() => null);
   const controller = useController();
   const [attached, setAttached] = React.useState(null);
@@ -256,6 +392,9 @@ export default {
   description: 'GPT-Live subscription or explicit API voice, with Hermes task delegation.',
   register(context) {
     desktopContext = context;
+    if (persistentTalkAvailable(context)) {
+      context.voice.register(({ controller }) => h(TalkHudRuntime, { context, controller }));
+    }
     context.register({
       id: 'talk', area: 'composer.actions', order: 45,
       render: () => h(DesktopTalkAction),
