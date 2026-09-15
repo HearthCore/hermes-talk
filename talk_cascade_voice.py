@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Custom-voice cascade — the provider thinks in text, ElevenLabs speaks.
 
 Native mode lets the realtime provider synthesize its own voice. Cascade mode

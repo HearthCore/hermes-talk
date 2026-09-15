@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """The real Hermes policy loop against a provider-neutral offline fake."""
 
 from __future__ import annotations

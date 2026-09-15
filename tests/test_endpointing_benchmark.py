@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 import tomllib
 from dataclasses import FrozenInstanceError
 from pathlib import Path

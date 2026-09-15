@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Native ``hermes talk setup`` detect/confirm/apply/verify workflow."""
 
 from __future__ import annotations

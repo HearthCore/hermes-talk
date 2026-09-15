@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Immutable native Discord packet/output admission and authenticated command fencing."""
 
 from __future__ import annotations

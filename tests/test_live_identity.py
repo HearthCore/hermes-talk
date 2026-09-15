@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Dedicated Live persona remains separate from function-call lanes."""
 
 from types import SimpleNamespace

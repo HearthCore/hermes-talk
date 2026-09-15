@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Pure OpenAI Realtime wire layer — session payloads and ephemeral mints.
 
 Ported from a prior proven Talk Mode implementation.

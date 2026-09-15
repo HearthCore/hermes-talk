@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Real HTTP fixture for passive-history v1 (host contract 813d255).
 
 The fixture uses the public wire envelopes and independently checks exact request

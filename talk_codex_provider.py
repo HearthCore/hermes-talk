@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Concrete consumer of Hermes' optional generic, profile-scoped task worker hook."""
 
 from __future__ import annotations

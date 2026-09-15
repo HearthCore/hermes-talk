@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Bounded progress phases for background work (hermes-talk#33).
 
 A Talk session used to know two things about a background job: it started

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Configured, fixed-route gateway transport for bound dashboard task operations."""
 
 from __future__ import annotations

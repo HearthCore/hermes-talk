@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Admission rules for pumping Discord capture into a canonical core session."""
 
 import asyncio

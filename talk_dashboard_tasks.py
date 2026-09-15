@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Canonical dashboard task coordinator: authenticated ownership, staging and child work.
 
 The browser owns audio and provider event observation. Python owns durable intent,

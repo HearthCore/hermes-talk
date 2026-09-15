@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Real-host integration, runnable from the canonical host test runner or an explicit checkout."""
 
 import asyncio

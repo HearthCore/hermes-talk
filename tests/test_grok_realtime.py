@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Grok (xAI) adapter tests with a scripted socket and no network.
 
 Mirrors the OpenAI adapter tests against the same neutral contract, plus the

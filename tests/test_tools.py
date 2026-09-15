@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Tool surface — the speakable-error contract and off-host degradation."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Discord lane cascade wiring — the voice channel speaks ElevenLabs PCM.
 
 The Discord lane enters the SAME ``run_talk_session`` the terminal uses

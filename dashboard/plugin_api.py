@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Browser voice surface — the backend half, mounted by the Hermes dashboard.
 
 Routes land at ``/api/plugins/hermes-talk/`` via

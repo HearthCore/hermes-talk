@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """The Realtime event loop — transport-agnostic.
 
 :class:`RealtimeRelay` takes one decoded Realtime server event and returns the

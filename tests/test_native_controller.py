@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Native adapters exercise the real task HTTP routes, selector, and SQLite coordinator."""
 
 from __future__ import annotations
