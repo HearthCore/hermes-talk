@@ -621,9 +621,10 @@ class OpenAICascadeVoice(CascadeVoice):
     qualifies, hosted or self-hosted, reached directly or through a gateway.
 
     The response body is raw PCM (``response_format="pcm"``, 16-bit LE,
-    24kHz) so it needs no container parsing before it reaches the exact
-    same ``on_audio`` sink the WebSocket lane feeds — the two lanes are
-    interchangeable from the relay's point of view.
+    24kHz) — unwrapped from a WAV container first if the endpoint wrapped it
+    anyway, see ``_pcm_payload`` — so it reaches the exact same ``on_audio``
+    sink the WebSocket lane feeds, and the two lanes stay interchangeable
+    from the relay's point of view.
     """
 
     def __init__(
@@ -700,8 +701,8 @@ class OpenAICascadeVoice(CascadeVoice):
             "response_format": self._response_format,
         }
         if self._request is not None:
-            return await self._request(
-                url=endpoint, headers=self._headers(), json=payload
+            return _pcm_payload(
+                await self._request(url=endpoint, headers=self._headers(), json=payload)
             )
         aiohttp = self._aiohttp or _import_aiohttp()
         session = aiohttp.ClientSession()
@@ -719,7 +720,7 @@ class OpenAICascadeVoice(CascadeVoice):
                     raise CascadeTTSError(
                         f"TTS endpoint returned HTTP {resp.status}"
                     )
-                return await resp.read()
+                return _pcm_payload(await resp.read())
         finally:
             await session.close()
 
@@ -729,6 +730,34 @@ class OpenAICascadeVoice(CascadeVoice):
         if not self._api_key:
             return {}
         return {"Authorization": f"Bearer {self._api_key}"}
+
+
+def _pcm_payload(body: bytes) -> bytes:
+    """The speech body as raw PCM, unwrapping a WAV container if one arrived.
+
+    ``response_format="pcm"`` asks for headerless sample data, and that is what
+    the ``on_audio`` sink is documented to receive — but a gateway in front of
+    the model may answer with a WAV container anyway (a LiteLLM gateway
+    proxying a self-hosted TTS model does exactly that). Playing those 44
+    header bytes as samples is an audible click at the start of every
+    sentence, and a container that ever disagreed with "24kHz mono s16le"
+    would corrupt the whole answer rather than click once. So: unwrap
+    RIFF/WAVE down to its ``data`` chunk; pass anything else through
+    untouched, because an endpoint that already speaks raw PCM is the common
+    case and must not be parsed at all.
+    """
+
+    if len(body) < 12 or body[:4] != b"RIFF" or body[8:12] != b"WAVE":
+        return body
+    offset = 12
+    while offset + 8 <= len(body):
+        chunk_id = body[offset : offset + 4]
+        size = int.from_bytes(body[offset + 4 : offset + 8], "little")
+        start = offset + 8
+        if chunk_id == b"data":
+            return body[start : start + size]
+        offset = start + size + (size % 2)  # chunks are word-aligned
+    return body
 
 
 def build_cascade_voice(

@@ -396,11 +396,15 @@ The key comes from `TALK_CASCADE_OPENAI_API_KEY`, falling back to
 every one of the three, same rule as every other Talk key); leaving all
 three unset sends no `Authorization` header at all, which many self-hosted
 endpoints expect. The response format is fixed to raw PCM (16-bit LE,
-24kHz) so no container parsing sits between the endpoint and the same
-playback sink the WebSocket lane feeds — the two lanes are interchangeable
-from the relay's point of view, including barge-in (cancels whichever
-request is in flight) and the one-response-degrades-to-text-only failure
-rule. Model and voice ids are backend-defined — this plugin does not know
+24kHz): the sink sees headerless samples, and if a gateway wraps the reply
+in a WAV container anyway — as a LiteLLM gateway proxying a self-hosted
+model does — the container is unwrapped to its `data` chunk before the
+samples are emitted, so a 44-byte header never plays as audio and a
+container that disagreed with "24kHz mono s16le" cannot corrupt the
+answer. Both lanes therefore reach the same playback sink the WebSocket
+lane feeds, and are interchangeable from the relay's point of view,
+including barge-in (cancels whichever request is in flight) and the
+one-response-degrades-to-text-only failure rule. Model and voice ids are backend-defined — this plugin does not know
 or validate the set your endpoint serves.
 
 The cascade speaks on every Talk surface:
@@ -410,6 +414,7 @@ The cascade speaks on every Talk surface:
 | Terminal (`hermes talk`) | The provider session opens in text-output mode; the cascade feeds the SAME playback sink the relay feeds. |
 | Discord (`talk join`) | The same shared session loop; cascade PCM24k takes the relay's exact path through the 24k→48k voice-channel conversion. |
 | Dashboard tab | The browser keeps its WebRTC socket but mints a text-output session and relays the model's text deltas to `POST /api/plugins/hermes-talk/cascade-tts`; the server-side cascade speaks them and streams PCM back. The ElevenLabs key never reaches the browser — the route sits behind the same `TALK_DASHBOARD_TOKEN` / loopback gate as the mint, and barge-in aborts the fetch, which cancels the TTS exactly like the terminal lane. |
+| Desktop app (plugin) | The desktop lane takes one direction per door: the model's text goes up on `POST /api/plugins/hermes-talk/cascade-feed`, the PCM24k comes down on the plugin's own WebSocket twin at `/cascade-tts?stream=<id>`. A plugin cannot stream an upload (its REST door answers JSON through the app's main process) and cannot read a byte stream back, so neither direction fits the HTTP lane's single streaming POST; the two doors meet in one server-side pipeline instead of a second implementation of the chunker. `{"abort": true}` is the barge-in: the TTS is cancelled, not flushed. The socket carries `TALK_DASHBOARD_TOKEN` as `?talk_token=` because an upgrade request cannot set a header; a stream exists only while its socket does, and a dropped socket releases it. |
 
 ## Use
 

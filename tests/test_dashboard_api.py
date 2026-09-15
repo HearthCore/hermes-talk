@@ -573,6 +573,21 @@ def test_route_handlers_covers_every_declared_route():
     assert len(decorated) == len(api.ROUTE_HANDLERS)
 
 
+def test_socket_handlers_covers_every_declared_socket_route():
+    """The WebSocket lanes are gated too — and by their own list.
+
+    A socket cannot answer 403, so it cannot ride ROUTE_HANDLERS (whose gate
+    test calls each handler with a remote peer). It gets the same drift check
+    against SOCKET_ROUTE_HANDLERS, and the closed-with-1008 assertion lives in
+    test_dashboard_cascade_desktop.py.
+    """
+
+    source = (DASHBOARD_DIR / "plugin_api.py").read_text(encoding="utf-8")
+    decorated = re.findall(r"@router\.websocket\(", source)
+
+    assert len(decorated) == len(api.SOCKET_ROUTE_HANDLERS)
+
+
 # -- the browser lane's return route (hermes-talk#35) -------------------------
 
 

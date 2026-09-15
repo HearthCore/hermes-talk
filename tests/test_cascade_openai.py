@@ -9,6 +9,7 @@ shape of ``test_cascade_voice.py``'s ElevenLabs suite but for the REST
 from __future__ import annotations
 
 import asyncio
+import struct
 
 import pytest
 
@@ -375,6 +376,129 @@ def test_barge_in_cancels_in_flight_request_and_emits_no_audio():
 # ---------------------------------------------------------------------------
 # Doctor check
 # ---------------------------------------------------------------------------
+
+
+def _wav(samples: bytes, *, rate: int = 24000, channels: int = 1, bits: int = 16) -> bytes:
+    """A minimal canonical WAV container around ``samples``.
+
+    What a gateway returns when it ignores ``response_format="pcm"`` —
+    LiteLLM in front of a self-hosted TTS model does exactly this, and the
+    bytes it wraps are already the 24kHz mono s16le the sink expects.
+    """
+
+    fmt = struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ", 16, 1, channels, rate,
+        rate * channels * bits // 8, channels * bits // 8, bits,
+    )
+    data = struct.pack("<4sI", b"data", len(samples)) + samples
+    body = fmt + data
+    return struct.pack("<4sI4s", b"RIFF", len(body) + 4, b"WAVE") + body
+
+
+def _speak_one(request_factory, *, api_key=FAKE_KEY, on_audio=None, on_stream_end=None):
+    """One response, one sentence, drained — the shape every container test needs."""
+
+    received: list[bytes] = []
+    ended: list[bool] = []
+
+    async def run():
+        voice = _voice(
+            request_factory,
+            api_key=api_key,
+            on_audio=on_audio or received.append,
+            on_stream_end=lambda: ended.append(True),
+        )
+        voice.start()
+        voice.handle_event(rt.ResponseStarted(response_id="r1"))
+        voice.handle_event(
+            rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text="One sentence.",
+                response_id="r1",
+                final=True,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+            )
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if ended:
+                break
+        await voice.aclose()
+
+    asyncio.run(run())
+    return received
+
+
+def test_a_wav_wrapped_body_reaches_the_sink_as_bare_samples():
+    """The sink is documented as raw PCM: a WAV wrapper must not leak through.
+
+    Those 44 header bytes played as samples click at the start of every
+    sentence, and a container that disagreed with 24kHz mono s16le would
+    corrupt the whole answer instead of clicking once.
+    """
+
+    samples = b"\x01\x02\x03\x04" * 40
+    received = _speak_one(_FakeRequestFactory([_wav(samples)]))
+
+    assert received == [samples]
+    assert received[0][:4] != b"RIFF"
+
+
+def test_a_raw_pcm_body_is_never_parsed():
+    """The common case — an endpoint that honours response_format=pcm."""
+
+    raw = b"\x7f\x00\xff\x7f" * 32
+    assert _speak_one(_FakeRequestFactory([raw])) == [raw]
+
+
+def test_a_body_that_merely_starts_with_riff_but_has_no_data_chunk_passes_through():
+    """Unrecognised container: emit it unchanged rather than emit silence.
+
+    Silence would be indistinguishable from a working session with a quiet
+    voice; a click is at least evidence of what actually arrived.
+    """
+
+    body = struct.pack("<4sI4s", b"RIFF", 40, b"WAVE") + b"junk-chunk-without-data"
+    assert _speak_one(_FakeRequestFactory([body])) == [body]
+
+
+def test_each_chunk_of_a_multi_sentence_answer_is_unwrapped_independently():
+    """One container per request, so the unwrap is per chunk, not per response."""
+
+    first = b"\x11\x22" * 24
+    second = b"\x33\x44" * 24
+
+    # Two sentences, so the chunker splits and each request carries its own
+    # container: the unwrap has to happen per chunk, not once per response.
+    factory = _FakeRequestFactory([_wav(first), _wav(second)])
+    received: list[bytes] = []
+    ended: list[bool] = []
+
+    async def run():
+        voice = _voice(factory, on_audio=received.append, on_stream_end=lambda: ended.append(True))
+        voice.start()
+        voice.handle_event(rt.ResponseStarted(response_id="r1"))
+        voice.handle_event(
+            rt.Transcript(
+                role=rt.TranscriptRole.ASSISTANT,
+                text="First sentence. Second sentence.",
+                response_id="r1",
+                final=False,
+                provenance=rt.TranscriptProvenance.OUTPUT_AUDIO,
+            )
+        )
+        voice.handle_event(rt.ResponseFinished(response_id="r1"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if ended:
+                break
+        await voice.aclose()
+
+    asyncio.run(run())
+
+    assert received == [first, second]
+    assert len(factory.calls) == 2
 
 
 def test_doctor_cascade_check_openai_pass(monkeypatch):

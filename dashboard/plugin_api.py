@@ -35,6 +35,7 @@ fallbacks there; see the README's Dashboard section.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import json
 import logging
@@ -113,6 +114,9 @@ except ImportError:  # pragma: no cover - offline tests run without the dashboar
             return lambda fn: fn
 
         def post(self, *_args, **_kwargs):
+            return lambda fn: fn
+
+        def websocket(self, *_args, **_kwargs):
             return lambda fn: fn
 
     class HTTPException(Exception):  # type: ignore[no-redef]
@@ -730,16 +734,33 @@ def _relay_transcript(text: str, *, final: bool) -> talk_realtime.Transcript:
 async def _cascade_pcm_stream(
     request, config: tuple[str, str, str, dict, str, str | None]
 ) -> AsyncIterator[bytes]:
+    """The HTTP lane's relay: NDJSON request body in, PCM out.
+
+    Thin on purpose — the pipeline itself lives in ``_cascade_pcm_frames``, so
+    this lane and the desktop lane's WebSocket cannot drift apart.
+    """
+
+    async for chunk in _cascade_pcm_frames(_cascade_request_lines(request), config):
+        yield chunk
+
+
+async def _cascade_pcm_frames(
+    lines: AsyncIterator[dict | None],
+    config: tuple[str, str, str, dict, str, str | None],
+) -> AsyncIterator[bytes]:
     """Feed one response's relayed text through CascadeVoice; yield its PCM.
 
-    A fresh CascadeVoice per request: one POST == one response's speech. The
+    ``lines`` is one response's text arriving from whichever door the caller
+    owns: the HTTP lane's request body, or the desktop plugin's ``/cascade-feed``
+    queue. Whichever it is, the pipeline below is identical.
+
+    A fresh CascadeVoice per response: one response == one speech run. The
     feeder task and this drain loop run CONCURRENTLY — that overlap is the
-    sentence pipelining, PCM flowing back while the browser is still sending
-    the model's text. Only an explicit ``{"done": ...}`` line completes the
-    answer: a stream that ends without it (the browser aborted on barge-in,
-    or the socket tore) falls to ``aclose()``, which cancels the in-flight
-    TTS exactly like the terminal lane's barge-in — an interrupted answer
-    must not keep talking.
+    sentence pipelining, PCM flowing back while the text is still arriving.
+    Only an explicit ``{"done": ...}`` line completes the answer: a stream that
+    ends without it (the client aborted on barge-in, or the socket tore) falls
+    to ``aclose()``, which cancels the in-flight TTS exactly like the terminal
+    lane's barge-in — an interrupted answer must not keep talking.
     """
 
     audio_queue: asyncio.Queue = asyncio.Queue()
@@ -759,10 +780,10 @@ async def _cascade_pcm_stream(
     state = {"completed": False, "speakable": False}
 
     async def consume_request() -> None:
-        """Feed the cascade from the browser's NDJSON stream."""
+        """Feed the cascade from the caller's line stream."""
 
         try:
-            async for line in _cascade_request_lines(request):
+            async for line in lines:
                 if line is None:
                     _log.warning(
                         "dashboard cascade relay: malformed stream line — answer cancelled"
@@ -830,6 +851,204 @@ async def cascade_tts(request: Request):
         _cascade_pcm_stream(request, config),
         media_type=CASCADE_PCM_MEDIA_TYPE,
     )
+
+
+# -- the desktop lane's half of the relay -------------------------------------
+#
+# The dashboard TAB can stream an upload, so it posts NDJSON and reads PCM back
+# in one exchange. The desktop plugin cannot: its REST door answers JSON, and
+# the app routes plugin REST through the main process, so there is no streaming
+# body and no binary response to read. Instead the two directions take the two
+# doors the plugin DOES have — text arrives over POST /cascade-feed, PCM leaves
+# over the plugin's own WebSocket twin — and both meet in one pipeline, so the
+# desktop lane cannot drift from the tab lane's chunking, barge-in, or
+# error-degradation. The plugin mints the stream id and names it on both.
+
+#: Live desktop cascade streams: ``stream id -> the queue its socket drains``.
+_CASCADE_STREAMS: dict[str, asyncio.Queue] = {}
+
+#: One stream per live desktop session is the design; the bound just stops a
+#: client that leaks sockets from growing this without limit.
+CASCADE_MAX_STREAMS = 8
+
+#: A stream id is the plugin's own opaque token, so it is validated as one:
+#: short, ASCII, no whitespace. A cap rather than a shape — the plugin mints
+#: UUIDs today and a different minting scheme must not need a server change.
+CASCADE_MAX_STREAM_ID_CHARS = 64
+
+#: Queue sentinels for the socket lane. _STREAM_CLOSED is the socket going
+#: away; _STREAM_ABORT is the operator speaking over the answer. Both end the
+#: current response's line stream WITHOUT its ``done`` line, which is exactly
+#: the drain loop's cancel path — an interrupted answer must not keep talking.
+_STREAM_CLOSED = object()
+_STREAM_ABORT = object()
+
+
+def _presented_socket_token(websocket) -> str:
+    """The dashboard token a WebSocket carries.
+
+    A browser — and Electron's renderer — cannot set a header on the upgrade,
+    so this lane's token rides ``?talk_token=``. The HTTP lane keeps its
+    header: it can send one.
+    """
+
+    presented = _presented_token(websocket)
+    if presented:
+        return presented
+    params = getattr(websocket, "query_params", None)
+    getter = getattr(params, "get", None)
+    return (getter("talk_token") or "").strip() if getter is not None else ""
+
+
+def _socket_allowed(websocket) -> bool:
+    """Same gate as ``require_dashboard_auth``, in the shape a socket needs.
+
+    A WebSocket cannot be answered with 401/403, so the caller closes it
+    instead — but the decision itself is the same one, over the same token.
+    """
+
+    configured = dashboard_token()
+    if configured is None:
+        return _is_loopback(websocket)
+    presented = _presented_socket_token(websocket)
+    return bool(presented) and hmac.compare_digest(
+        presented.encode("utf-8"), configured.encode("utf-8")
+    )
+
+
+def _valid_stream_id(raw: object) -> str:
+    """The plugin's stream id, or ``""`` when it is not one."""
+
+    value = str(raw or "").strip()
+    if not value or len(value) > CASCADE_MAX_STREAM_ID_CHARS:
+        return ""
+    return value if value.isascii() and not any(ch.isspace() for ch in value) else ""
+
+
+async def _cascade_socket_lines(queue: asyncio.Queue) -> AsyncIterator[dict | None]:
+    """One response's lines off a desktop stream, ending on done or teardown.
+
+    Ends without a ``done`` when the operator interrupted (``_STREAM_ABORT``)
+    or the socket went away (``_STREAM_CLOSED``) — the drain loop reads both as
+    the cancel path it already has for a torn HTTP body.
+    """
+
+    while True:
+        item = await queue.get()
+        if item is _STREAM_CLOSED or item is _STREAM_ABORT:
+            return
+        yield item
+        if item is None or "done" in item:
+            return
+
+
+@router.websocket("/cascade-tts")
+async def cascade_tts_socket(websocket) -> None:
+    """PCM24k out for whichever response the plugin feeds to its stream id.
+
+    One socket spans a session: each response's text arrives on
+    ``POST /cascade-feed``, this route answers that response's PCM as
+    ``{"pcm": <base64>}`` frames and closes the run with ``{"end": true}``,
+    then waits for the next response. A refusal is a frame
+    (``{"error": ...}``) only when the socket is already open; the gate runs
+    before ``accept``, so a rejected dial is a close code, not a body.
+    """
+
+    if not _socket_allowed(websocket):
+        await websocket.close(code=1008)
+        return
+    stream = _valid_stream_id(getattr(websocket, "query_params", {}).get("stream"))
+    if not stream:
+        await websocket.close(code=1008)
+        return
+    if stream in _CASCADE_STREAMS or len(_CASCADE_STREAMS) >= CASCADE_MAX_STREAMS:
+        await websocket.close(code=1013)
+        return
+    try:
+        config = _resolve_cascade_relay_config()
+    except HTTPException as exc:
+        await websocket.close(code=1011, reason=str(exc.detail)[:120])
+        return
+
+    queue: asyncio.Queue = asyncio.Queue()
+    _CASCADE_STREAMS[stream] = queue
+    closed = asyncio.Event()
+
+    async def watch_for_close() -> None:
+        """The plugin never sends a frame: this only learns the socket died.
+
+        Without it a session that goes away between responses would sit in the
+        drain loop forever, holding the stream id and the TTS teardown.
+        """
+
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    return
+        except Exception:  # noqa: BLE001 - any receive failure IS the close signal
+            return
+        finally:
+            closed.set()
+            queue.put_nowait(_STREAM_CLOSED)
+
+    watcher = asyncio.create_task(watch_for_close())
+    await websocket.accept()
+    try:
+        while not closed.is_set():
+            async for pcm in _cascade_pcm_frames(_cascade_socket_lines(queue), config):
+                await websocket.send_json({"pcm": base64.b64encode(pcm).decode("ascii")})
+            if closed.is_set():
+                break
+            await websocket.send_json({"end": True})
+    except Exception as exc:  # noqa: BLE001 - a broken socket is not an answer bug
+        _log.warning("dashboard cascade socket: %s", exc)
+    finally:
+        closed.set()
+        queue.put_nowait(_STREAM_CLOSED)
+        if not watcher.done():
+            watcher.cancel()
+        with suppress(Exception):
+            await asyncio.wait({watcher})
+        _CASCADE_STREAMS.pop(stream, None)
+
+
+@router.post("/cascade-feed")
+async def cascade_feed(request: Request) -> dict:
+    """Push one line of a response's text into its live desktop stream.
+
+    The same two line shapes the HTTP lane takes off its request body —
+    ``{"delta": ...}`` per model delta, one ``{"done": ...}`` at the end — plus
+    ``{"abort": true}`` for a barge-in, which is the HTTP lane's closed socket
+    expressed as a line. An unknown stream id is a 404: the plugin's socket is
+    the stream, so feeding before it opened (or after it died) is a client bug
+    with nothing to speak into.
+    """
+
+    require_dashboard_auth(request)
+    body = await _json_body(request)
+    stream = _valid_stream_id(body.get("stream"))
+    queue = _CASCADE_STREAMS.get(stream) if stream else None
+    if queue is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no live cascade stream for that id — open /cascade-tts first",
+        )
+    if body.get("abort") is True:
+        queue.put_nowait(_STREAM_ABORT)
+        return {"ok": True}
+    line = body.get("done")
+    if not isinstance(line, str):
+        line = body.get("delta")
+    if not isinstance(line, str):
+        raise HTTPException(
+            status_code=400, detail="a feed line carries either 'delta' or 'done'"
+        )
+    if len(line.encode("utf-8")) > CASCADE_MAX_LINE_BYTES:
+        queue.put_nowait(None)  # oversized line: cancel, exactly like the HTTP lane
+        raise HTTPException(status_code=413, detail="feed line too long")
+    queue.put_nowait({"done" if "done" in body else "delta": line})
+    return {"ok": True}
 
 
 @router.get("/runs")
@@ -1117,6 +1336,7 @@ ROUTE_HANDLERS = (
     create_session,
     run_tool,
     cascade_tts,
+    cascade_feed,
     list_runs,
     task_event,
     task_state,
@@ -1130,6 +1350,12 @@ ROUTE_HANDLERS = (
     task_switch,
     *LIVE_ROUTE_HANDLERS,
 )
+
+#: The WebSocket lanes. Kept beside ROUTE_HANDLERS because the gate is the
+#: same decision in a different shape: an HTTP route answers 403, a socket
+#: closes with 1008, and both are asserted against their own list so a new
+#: lane cannot land ungated.
+SOCKET_ROUTE_HANDLERS = (cascade_tts_socket,)
 
 
 __all__ = [
