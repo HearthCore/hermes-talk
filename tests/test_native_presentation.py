@@ -213,7 +213,9 @@ def test_failed_provider_handoff_is_unknown_without_retry():
 
 
 def test_discord_real_audio_source_finishes_only_when_player_consumes_frames(room):
-    import discord
+    # The real library is not a dependency of the plugin; this case proves the
+    # actual AudioSource contract where it is installed and skips where it is not.
+    discord = pytest.importorskip("discord")
 
     async def scenario():
         room.audio._source = talk_discord._new_source(room.audio._outbound)
@@ -237,7 +239,7 @@ def test_discord_real_audio_source_finishes_only_when_player_consumes_frames(roo
 
 
 def test_discord_audience_revocation_drops_queued_private_summary_before_next_frame(room):
-    import discord
+    discord = pytest.importorskip("discord")
 
     async def scenario():
         room.audio._source = talk_discord._new_source(room.audio._outbound)
