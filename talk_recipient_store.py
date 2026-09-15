@@ -96,7 +96,7 @@ class RecipientStore:
             raise DashboardTaskError("event_conflict", 409)
         return record
 
-    def prepare(self, operation_id, name, arguments, *, target=None, result=None):
+    def prepare(self, operation_id, name, arguments, *, target=None, result=None, guard=None):
         with self._db() as db:
             existing = self._operation(db, operation_id, name, arguments)
             if existing:
@@ -104,6 +104,10 @@ class RecipientStore:
             selection = self._selection(db)
             if name in {"send_agent_message", "inspect_screen"}:
                 target = selection["selected"]
+            if guard is not None:
+                # The caller's captured identity is asserted against the CURRENT selection in
+                # this same transaction, before any row binds a target. A refusal stores nothing.
+                guard(target)
             if name == "send_agent_message" and target:
                 prior_rows = db.execute(
                     "SELECT record FROM talk_recipient_operations WHERE owner=?",

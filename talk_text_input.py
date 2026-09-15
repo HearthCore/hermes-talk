@@ -158,20 +158,30 @@ def _authorize_run(tasks, bound, fields):
     }, run
 
 
-def _settled(operation, prior, name, arguments):
+def _settled(operation, prior, name, arguments, selected):
     """A repeated input_id returns its stored action instead of dispatching again.
 
-    This is the only guard against a second ``/stop`` POST for a repeated cancel.
-    A delivery the bridge left open (queued/unknown) re-enters the tool path,
-    which reconciles the original operation and never resends it.
+    The stored action was looked up by this request's own identity (interaction
+    and call id). It is reused when it is settled and is the same request: the
+    same name and arguments, or the ``steer_work`` that ``tool()`` rewrote a
+    Codex-worker message into, provided its control target is still the selected
+    worker. Everything else re-enters ``tool()``, whose own fences hold: a
+    different request conflicts in ``prepare_action``, an open bridge delivery
+    (queued/unknown) is reconciled and never resent, a settled stop is replayed
+    from its stored reply and a torn one is only observed, never posted again.
     """
-    if (prior["name"], prior["arguments"]) != (name, arguments):
-        return False
     if prior["state"] not in SETTLED_ACTIONS:
         return False
-    if operation == "message":
-        status = (prior.get("recipient_receipt") or {}).get("status")
-        return status not in OPEN_DELIVERIES
+    if prior["name"] == name:
+        if prior["arguments"] != arguments:
+            return False
+    elif operation == "message" and prior["name"] == "steer_work":
+        if selected is None or prior.get("control_api_run_id") != selected.get("task_id"):
+            return False
+    else:
+        return False
+    if operation == "message" and prior["name"] == "send_agent_message":
+        return (prior.get("recipient_receipt") or {}).get("status") not in OPEN_DELIVERIES
     return True
 
 
@@ -228,7 +238,9 @@ def dispatch(tasks, request, body, fields):
     selected = run = None
     if operation == "message":
         selected = _selected_recipient(tasks, bound, fields["recipient"])
-        name, arguments = "send_agent_message", {"message": fields["text"]}
+        # The verified identity travels with the send: the store binds to it or refuses.
+        name = "send_agent_message"
+        arguments = {"message": fields["text"], **fields["recipient"]}
     elif operation == "start_worker":
         worker = fields.get("worker", "codex")
         bound.capabilities = tasks.capabilities(bound, refresh=True)
@@ -253,11 +265,13 @@ def dispatch(tasks, request, body, fields):
 
     bound.stages.update(bound.token, record["id"], decide)
     prior = bound.stages.live_action(bound.token, record["id"], call_id=call_id)
-    if prior is not None and _settled(operation, prior, name, arguments):
+    if prior is not None and _settled(operation, prior, name, arguments, selected):
         action = prior
     else:
-        if operation == "cancel" and run.get("status") in TERMINAL_RUNS:
-            # The fresh run read above: a finished run is refused without a stop POST.
+        unposted = prior is None or prior["state"] == "prepared"
+        if operation == "cancel" and unposted and run.get("status") in TERMINAL_RUNS:
+            # No stop has been posted for this input: a finished run is refused without one.
+            # A stop already in flight (submitting) is observed by tool() instead.
             raise DashboardTaskError("gateway_refused", 409)
         result = tasks.tool(request, {
             **context, "interaction_id": record["id"], "response_id": response_id,

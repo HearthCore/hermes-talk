@@ -392,7 +392,7 @@ class RecipientService:
         allowed = {
             "list_recipients": {"app"},
             "select_recipient": {"reference", *IDENTITY_FIELDS},
-            "send_agent_message": {"message", "app"},
+            "send_agent_message": {"message", "app", *IDENTITY_FIELDS},
             "inspect_screen": set(),
             "catalog_recipients": {"app", "limit", "cursor"},
             "read_recipient_history": {*IDENTITY_FIELDS, "limit", "cursor"},
@@ -427,6 +427,25 @@ class RecipientService:
                 raise DashboardTaskError("invalid_event", 400)
         if name == "send_agent_message":
             bounded_text(arguments.get("message"), maximum=16000)
+            if set(arguments) & (set(IDENTITY_FIELDS) - {"app"}):
+                # A captured send names its recipient exactly, or not at all.
+                if not set(IDENTITY_FIELDS) <= set(arguments):
+                    raise DashboardTaskError("invalid_event", 400)
+                for key in IDENTITY_FIELDS:
+                    bounded_text(arguments[key], maximum=512)
+
+    @staticmethod
+    def identity_of(arguments):
+        """The exact recipient a captured send names, or None for a selection-bound send."""
+        if isinstance(arguments, dict) and set(IDENTITY_FIELDS) <= set(arguments):
+            return {key: arguments[key] for key in IDENTITY_FIELDS}
+        return None
+
+    @staticmethod
+    def require_identity(target, expected):
+        """A later selection cannot retarget a captured send: refuse before anything binds."""
+        if target is None or any(target.get(key) != expected[key] for key in IDENTITY_FIELDS):
+            raise RecipientError("recipient_selection_mismatch", 409)
 
     def tool(self, request, body, *, action, bound=None):
         """Action is the server's prepared canonical action, never a provider argument."""
@@ -789,7 +808,11 @@ class RecipientService:
         arguments = body.get("arguments", {})
         self._arguments("send_agent_message", arguments)
         store, backend = self._store(bound), self._backend(bound)
-        record, _ = store.prepare(operation_id, "send_agent_message", arguments)
+        expected = self.identity_of(arguments)
+        record, _ = store.prepare(
+            operation_id, "send_agent_message", arguments,
+            guard=(lambda target: self.require_identity(target, expected)) if expected else None,
+        )
         target = record["target"]
         if target is None:
             if record["result"] is None:

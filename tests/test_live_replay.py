@@ -80,6 +80,11 @@ def table_counts(fixture):
         )
 
 
+def announced(session):
+    """Every command after the delegation's own result: proactive announcements and replays."""
+    return list(session.commands[1:])
+
+
 def appended(session):
     return [command for command in session.commands if isinstance(command, rt.AppendLiveContext)]
 
@@ -94,7 +99,7 @@ def test_live_replay_appends_summary_to_bound_session_and_persists_context_submi
             retired = presentation(fixture, event_id)
             assert retired["state"] == "unknown" and retired["unknown"]
             assert retired["replay_eligible"] and not retired["context_submitted"]
-            assert appended(fixture.browser.session) == []
+            assert announced(fixture.browser.session) == []
             reply = await client.post("/live/speech", json=replay_body(body, event_id, 2))
             assert reply.status_code == 200, reply.text
             data = reply.json()
@@ -106,9 +111,11 @@ def test_live_replay_appends_summary_to_bound_session_and_persists_context_submi
             assert data["operation_id"] and data["run_id"]
             assert "completed" in data["content"] and "response" not in data
             assert not any(secret in reply.text for secret in SECRETS)
-            added = appended(fixture.browser.session)
+            added = announced(fixture.browser.session)
             assert len(added) == 1 and added[0].content == data["content"]
-            assert added[0].kind == "message" and added[0].delegation_id is None
+            # The job's delegation is still open, so the replay answers it there.
+            assert isinstance(added[0], rt.SubmitDelegationResult)
+            assert added[0].delegation_id == "delegation-one"
             assert presentation(fixture, event_id)["state"] == "context_submitted"
             assert speech_rows(fixture) == [(data["attempt_id"], "sent")]
             assert len(fixture.host.jobs) == 1
@@ -136,7 +143,7 @@ def test_live_replay_rejects_foreign_binding_and_stale_generation(environment):
                 if status == 409:
                     assert reply.json()["detail"]["code"] == "connection_stale"
                 assert not any(secret in reply.text for secret in SECRETS)
-            assert appended(fixture.browser.session) == []
+            assert announced(fixture.browser.session) == []
             assert speech_rows(fixture) == rows
             assert presentation(fixture, event_id)["attempt_id"] == rows[0][0]
             assert not binding.closed
@@ -159,7 +166,7 @@ def test_live_replay_refuses_non_terminal_or_active_attempt(environment):
                 "/live/speech", json=replay_body(body, running["event_id"], 1),
             )
             assert reply.status_code == 200 and reply.json()["speak"] is False, reply.text
-            assert appended(fixture.browser.session) == [] and speech_rows(fixture) == []
+            assert announced(fixture.browser.session) == [] and speech_rows(fixture) == []
             fixture.host.jobs["remote-1"].update(
                 status="completed", output="Done", updated_at=200.0, last_event="run.completed",
             )
@@ -168,14 +175,13 @@ def test_live_replay_refuses_non_terminal_or_active_attempt(environment):
             commands = len(fixture.browser.session.commands)
             await binding.proactive(quiet(2))
             # The proactive announcement rides the job's own delegation, not a replay append.
-            announced = fixture.browser.session.commands[commands:]
-            assert len(announced) == 1 and isinstance(announced[0], rt.SubmitDelegationResult)
+            after = fixture.browser.session.commands[commands:]
+            assert len(after) == 1 and isinstance(after[0], rt.SubmitDelegationResult)
             active = presentation(fixture, event_id)
             assert active["state"] == "context_submitted" and not active["replay_eligible"]
             reply = await client.post("/live/speech", json=replay_body(body, event_id, 3))
             assert reply.status_code == 200 and reply.json()["speak"] is False, reply.text
             assert len(fixture.browser.session.commands) == commands + 1
-            assert appended(fixture.browser.session) == []
             assert speech_rows(fixture) == [(active["attempt_id"], "sent")]
 
     asyncio.run(run())
@@ -202,14 +208,14 @@ def test_live_replay_send_failure_persists_unknown_without_retry(environment):
             lost = presentation(fixture, event_id)
             assert lost["state"] == "unknown" and lost["unknown"] and lost["replay_eligible"]
             assert lost["attempt_id"] != first
-            assert appended(session) == [] and not binding.speech_attempts
+            assert announced(session) == [] and not binding.speech_attempts
             assert not binding.closed
             again = await client.post("/live/speech", json=replay_body(body, event_id, 3))
             assert again.status_code == 200, again.text
             sent = again.json()["attempt_id"]
             assert sent not in {first, lost["attempt_id"]}
             assert again.json()["presentation"]["state"] == "context_submitted"
-            assert len(appended(session)) == 1
+            assert len(announced(session)) == 1
             assert speech_rows(fixture) == [(sent, "sent")]
             assert len(fixture.host.jobs) == 1
 
@@ -237,7 +243,7 @@ def test_live_replay_never_stages_input_or_coordinator_work(environment, monkeyp
             assert reply.status_code == 200 and reply.json()["speak"] is True, reply.text
             assert table_counts(fixture) == counts and fixture.host.jobs == jobs
             assert len(fixture.decision.calls) == 1
-            assert len(appended(fixture.browser.session)) == 1
+            assert len(announced(fixture.browser.session)) == 1
             assert not any(
                 path == "/v1/runs" or path.endswith("/stop")
                 for _, path, _, _ in fixture.host.requests[-6:]
@@ -257,7 +263,7 @@ def test_live_speech_without_replay_keeps_preparation_only_behaviour(environment
             speech = reply.json()
             assert speech["speak"] is True and "completed" in speech["content"]
             assert "response" not in speech and speech["presentation"]["state"] == "claimed"
-            assert appended(fixture.browser.session) == []
+            assert announced(fixture.browser.session) == []
             assert speech_rows(fixture) == [(speech["attempt_id"], "queued")]
             for wrong in ({"replay": True},
                           {"replay": True, "presentation_protocol": 0,
@@ -271,7 +277,33 @@ def test_live_speech_without_replay_keeps_preparation_only_behaviour(environment
                 })
                 assert refused.status_code == 400, refused.text
                 assert refused.json()["detail"]["code"] == "invalid_event"
-            assert appended(fixture.browser.session) == []
+            assert announced(fixture.browser.session) == []
             assert speech_rows(fixture) == [(speech["attempt_id"], "queued")]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_live_replay_answers_an_open_delegation_and_appends_for_a_retired_one(
+    environment, retired,
+):
+    async def run():
+        async with application(environment) as (client, fixture):
+            body, binding, event_id = await finished_job(client, fixture)
+            await retire_first_attempt(fixture, binding)
+            assert binding.job_delegations == {"1": "delegation-one"}
+            if retired:
+                binding.retired.add("delegation-one")
+            reply = await client.post("/live/speech", json=replay_body(body, event_id, 2))
+            assert reply.status_code == 200 and reply.json()["speak"] is True, reply.text
+            added = announced(fixture.browser.session)
+            assert len(added) == 1 and added[0].content == reply.json()["content"]
+            if retired:
+                assert isinstance(added[0], rt.AppendLiveContext)
+                assert added[0].kind == "message" and added[0].delegation_id is None
+            else:
+                assert isinstance(added[0], rt.SubmitDelegationResult)
+                assert added[0].delegation_id == "delegation-one"
+            assert presentation(fixture, event_id)["state"] == "context_submitted"
 
     asyncio.run(run())

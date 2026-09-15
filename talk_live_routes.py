@@ -185,7 +185,11 @@ def mount_live_routes(
             )
             if not speech.get("speak"):
                 return speech
-            submitted = await binding.present(speech)
+            # A job whose provider delegation is still open gets its result there; a
+            # retired delegation cannot be answered, so the summary is appended as context.
+            submitted = await binding.present(
+                speech, delegation_id=binding.open_delegation(speech["run_id"])
+            )
             if submitted is None:
                 return {**speech, "speak": False, "reason": "dispatch_refused"}
             return {**speech, "presentation": submitted.get("presentation")}

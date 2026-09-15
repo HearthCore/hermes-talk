@@ -6,8 +6,10 @@ import asyncio
 import importlib.util
 import json
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from starlette.routing import Route
 from test_dashboard_steering import SteeringHost
 from test_live_coordinator import Decision
 from test_recipient_history import NATIVE_HOST, NativeHost
+from test_recipients import recipient
 from test_target_switching import CatalogHost
 
 import talk_audio
@@ -37,20 +40,28 @@ class Bridge(NativeHost):
 
     def __init__(self):
         super().__init__(None)
+        self.live_b = recipient("live-claude", "claude_code",
+                                operations=["send", "history", "status"])
         self.journal, self.torn = {}, False
 
     def __call__(self, request):
         operation = request.url.path.rsplit("/", 1)[1]
-        if operation not in {"send", "reconcile"}:
+        if operation in {"probe", "catalog", "history", "status"}:
             return super().__call__(request)
         body = json.loads(request.content)
         self.calls.append((operation, body, request))
         assert request.headers["Authorization"].startswith("Bearer ")
-        target = next((row for row in [*self.rows, self.live]
+        if operation == "list":
+            return httpx.Response(200, json={
+                "recipients": [self.live, self.live_b], "capabilities": {}, "truncated": False,
+            })
+        target = next((row for row in [*self.rows, self.live, self.live_b]
                        if row["target_token"] == body.get("target_token")), None)
         if target is None:
             return httpx.Response(404, json={"error": "recipient_not_found"})
         identity = {key: target.get(key, NATIVE_HOST) for key in IDENTITY_FIELDS}
+        if operation == "select":
+            return httpx.Response(200, json={**identity, "status": "selected"})
         if operation == "send":
             assert "commit_token" not in body and body["operation_id"] not in self.journal
             self.journal[body["operation_id"]] = {
@@ -81,12 +92,34 @@ class SeamHost(SteeringHost, CatalogHost):
         self.read_unavailable, self.receipt_override = False, None
         self.codex_worker = True
         self.bridge = Bridge()
+        # (entered, release) events: park the next passive-history reconcile read. It is
+        # the first host read after the operator's words are committed and before tool().
+        self.hold = None
+        self.stop_torn = None  # "recorded": raise after applying the stop; "lost": before
+        self.stop_attempts = 0
+        self.steer_requests = 0
 
     def __call__(self, request):
-        if "/v1/recipient-bridge/" in request.url.path:
+        path = request.url.path
+        if "/v1/recipient-bridge/" in path:
             return self.bridge(request)
+        if "/steer" in path:
+            self.steer_requests += 1
+        if path.endswith("/passive-history/reconcile") and self.hold is not None:
+            entered, release = self.hold
+            self.hold = None
+            entered.set()
+            assert release.wait(5)
+        if path.endswith("/stop"):
+            self.stop_attempts += 1
+            if self.stop_torn == "lost":
+                self.stop_torn = None
+                raise httpx.ReadError("stop request lost", request=request)
         response = super().__call__(request)
-        if self.codex_worker and request.url.path.endswith("/v1/capabilities"):
+        if path.endswith("/stop") and self.stop_torn == "recorded":
+            self.stop_torn = None
+            raise httpx.ReadError("stop acknowledgement lost", request=request)
+        if self.codex_worker and path.endswith("/v1/capabilities"):
             data = response.json()
             data["features"]["linked_child_dispatch"]["external_workers"] = {
                 "version": 1, "names": ["hermes-talk-codex"],
@@ -254,14 +287,16 @@ async def job(client, owner, *, input_id="start-one", text="Start the background
     return started.json(), {"run_id": card["run_id"], "action_id": card["action_id"]}
 
 
-async def select(client, owner, *, read_only=False):
+async def select(client, owner, *, read_only=False, app="codex_desktop", exclude=None):
     catalog = await client.post("/recipients/catalog", json=owner)
     assert catalog.status_code == 200, catalog.text
     row = next(row for row in catalog.json()["recipients"]
-               if row["read_only"] is read_only and row["app"] == "codex_desktop")
+               if row["read_only"] is read_only and row["app"] == app
+               and (exclude is None or row["task_id"] != exclude["task_id"]))
     identity = {key: row[key] for key in IDENTITY_FIELDS}
+    # A fresh operation id per call: a repeated id replays the earlier selection, by design.
     selected = await client.post("/recipients/select", json={
-        **owner, **identity, "action_id": "select-" + row["recipient_id"],
+        **owner, **identity, "action_id": "select-" + row["recipient_id"] + "-" + uuid4().hex,
     })
     assert selected.status_code == 200 and selected.json()["state"] == "selected", selected.text
     return identity
@@ -559,6 +594,99 @@ def test_approval_with_stale_request_id_refused_and_actionable_flag_exposed(seam
             assert state.json()["jobs"][0]["approval"] == {
                 "state": "current", "approvals": [], "actionable": False,
             }
+
+    asyncio.run(run())
+
+
+def test_recipient_send_refuses_a_selection_switched_after_capture(seam):
+    async def run():
+        async with client_for(seam) as client:
+            owner = context(await attach(client))
+            identity_a = await select(client, owner)
+            bridge, text = seam.host.bridge, "Words captured for A."
+            entered, release = threading.Event(), threading.Event()
+            seam.host.hold = (entered, release)
+            pending = asyncio.create_task(
+                send(client, owner, "message", text, "captured", recipient=identity_a)
+            )
+            assert await asyncio.to_thread(entered.wait, 5)
+            assert history(seam).count(text) == 1  # committed before the switch lands
+            identity_b = await select(client, owner, app="claude_code")
+            assert identity_b != identity_a
+            release.set()
+            reply = await pending
+            assert reply.status_code == 409 and code(reply) == "recipient_selection_mismatch"
+            assert bridge.sends() == []
+            assert history(seam).count(text) == 1
+            interactions, actions = records(seam, owner)
+            assert [row["input_id"] for row in interactions] == ["captured"]
+            assert [action["state"] for action in actions] == ["prepared"]
+            assert await select(client, owner) == identity_a
+            again = await send(client, owner, "message", text, "captured", recipient=identity_a)
+            assert again.status_code == 200 and again.json()["state"] == "posted", again.text
+            sends = bridge.sends()
+            assert len(sends) == 1
+            assert sends[0][1]["target_token"] == bridge.live["target_token"]
+            assert history(seam).count(text) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("torn", ["recorded", "lost"])
+def test_torn_stop_is_observed_not_posted_again(seam, torn):
+    async def run():
+        async with client_for(seam) as client:
+            owner = context(await attach(client))
+            _, card = await job(client, owner)
+            host = seam.host
+            remote = next(iter(host.jobs))
+            host.stop_torn = torn
+            first = await send(client, owner, "cancel", "Cancel this job.", "torn-cancel", **card)
+            assert first.status_code == 503 and code(first) == "gateway_unavailable", first.text
+            assert host.stop_attempts == 1
+            assert host.jobs[remote]["status"] == ("cancelled" if torn == "recorded"
+                                                   else "running")
+            for _ in range(2):
+                again = await send(client, owner, "cancel", "Cancel this job.", "torn-cancel",
+                                   **card)
+                assert again.status_code == 200 and again.json()["state"] == "unknown", again.text
+                assert host.stop_attempts == 1
+            _, actions = records(seam, owner)
+            stop = next(action for action in actions if action["name"] == "stop_work")
+            assert stop["state"] == "submitting"
+            assert json.loads(stop["output"])["stop"] == "unconfirmed"
+            assert history(seam).count("Cancel this job.") == 1
+
+    asyncio.run(run())
+
+
+def test_repeated_message_to_a_codex_worker_steers_once(seam):
+    async def run():
+        async with client_for(seam) as client:
+            owner = context(await attach(client))
+            await job(client, owner)
+            worker = await select(client, owner, app="codex_worker")
+            host = seam.host
+            first = await send(client, owner, "message", STEER_TEXT, "worker-msg",
+                               recipient=worker)
+            assert first.status_code == 200 and first.json()["state"] == "queued", first.text
+            assert {key: first.json()["recipient"][key] for key in IDENTITY_FIELDS} == worker
+            assert len(host.posts("/steer")) == 1 and host.deliveries[0]["input"] == STEER_TEXT
+            reads = host.steer_requests
+            second = await send(client, owner, "message", STEER_TEXT, "worker-msg",
+                                recipient=worker)
+            assert second.status_code == 200 and second.json() == first.json(), second.text
+            assert len(host.posts("/steer")) == 1 and host.steer_requests == reads
+            _, actions = records(seam, owner)
+            steers = [action for action in actions if action["name"] == "steer_work"]
+            assert len(steers) == 1 and steers[0]["control_api_run_id"] == worker["task_id"]
+            await job(client, owner, input_id="start-two", text="Start another worker")
+            other = await select(client, owner, app="codex_worker", exclude=worker)
+            conflict = await send(client, owner, "message", STEER_TEXT, "worker-msg",
+                                  recipient=other)
+            assert conflict.status_code == 409 and code(conflict) == "event_conflict"
+            assert len(host.posts("/steer")) == 1 and len(host.deliveries) == 1
+            assert history(seam).count(STEER_TEXT) == 1
 
     asyncio.run(run())
 

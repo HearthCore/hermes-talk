@@ -536,6 +536,13 @@ class BrowserBinding:
                 speech, delegation_id=self.job_delegations.get(str(speech["run_id"]))
             )
 
+    def open_delegation(self, run_id):
+        """The provider delegation still awaiting this job's result, or None once retired."""
+        delegation_id = self.job_delegations.get(str(run_id))
+        if delegation_id is None or delegation_id in self.retired:
+            return None
+        return delegation_id
+
     async def present(self, speech, *, delegation_id=None):
         """Announce one prepared speech into this exact binding, fenced by its attempt receipt.
 
