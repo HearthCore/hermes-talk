@@ -174,3 +174,19 @@ def test_replay_of_approval_reference_is_not_speakable(tmp_path):
     event = approval_event(store, token)
     with pytest.raises(TaskEventError, match="replay_not_speakable"):
         claim(store, token, event, replay=True)
+
+
+def test_replaying_a_duplicate_observation_projects_the_newest_attempt(tmp_path):
+    store, _, token, source, event = completed(tmp_path)
+    first = claim(store, token, event)
+    store.acknowledge_speech(token, first, "submitting")
+    store.acknowledge_speech(token, first, "unknown")
+    store.observe_poll(token, source, 7, poll(2), live=True)
+    newest = store.page(token)["events"][-1]["event_id"]
+    replay = claim(store, token, newest, replay=True)
+    assert store.job_presentations(token)[7]["attempt_id"] == replay.attempt_id
+    assert store.job_presentations(token)[7]["state"] == "claimed"
+    store.acknowledge_speech(token, replay, "submitting")
+    store.acknowledge_speech(token, replay, "unknown")
+    original_replay = claim(store, token, event, replay=True)
+    assert store.job_presentations(token)[7]["attempt_id"] == original_replay.attempt_id

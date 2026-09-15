@@ -134,6 +134,7 @@ class TaskEvents:
                 "claim_expires": "REAL",
                 "retry_at": "REAL NOT NULL DEFAULT 0",
                 "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "attempt_order": "INTEGER NOT NULL DEFAULT 0",
                 "response_id": "TEXT",
                 "facts": "TEXT NOT NULL DEFAULT '{}'",
             }.items():
@@ -730,7 +731,7 @@ class TaskEvents:
 
     def _latest_notices(self, db):
         rows = db.execute(
-            "SELECT e.*,s.state AS delivery,s.retry_at FROM task_events e "
+            "SELECT e.*,s.state AS delivery,s.retry_at,s.attempt_order FROM task_events e "
             "LEFT JOIN task_event_speech s ON s.event_idx=e.idx "
             "WHERE e.owner=? ORDER BY e.idx DESC", (self._owner.key,)
         ).fetchall()
@@ -744,9 +745,12 @@ class TaskEvents:
                 closed.add(source)
             if source in closed:
                 continue
-            if source not in selected or row["delivery"] is not None or (
-                selected[source]["delivery"] is None
-                and row["live"] and not selected[source]["live"]
+            prior = selected.get(source)
+            if prior is None or (row["delivery"] is not None and (
+                prior["delivery"] is None or row["attempt_order"] > prior["attempt_order"]
+            )) or (
+                row["delivery"] is None and prior["delivery"] is None
+                and row["live"] and not prior["live"]
             ):
                 selected[source] = row
         return sorted(selected.values(), key=lambda row: row["idx"], reverse=True)
@@ -858,10 +862,13 @@ class TaskEvents:
             ).fetchone():
                 raise TaskEventError("delivery_exists")
             attempt = uuid.uuid4().hex
+            order = db.execute(
+                "UPDATE metadata SET next_generation=next_generation+1 RETURNING next_generation"
+            ).fetchone()[0]
             db.execute(
                 "INSERT OR REPLACE INTO task_event_speech "
                 "(event_idx,attempt_id,generation,connection_id,state,playback_supported,protocol,"
-                "claim_expires,retry_count) VALUES (?,?,?,?,?,?,?,?,?)",
+                "claim_expires,retry_count,attempt_order) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     event["idx"],
                     attempt,
@@ -872,6 +879,7 @@ class TaskEvents:
                     presentation_protocol,
                     self._clock() + self.CLAIM_SECONDS,
                     prior["retry_count"] if prior and not replay else 0,
+                    order,
                 ),
             )
             return SpeechAttempt(event_id, attempt, token)
