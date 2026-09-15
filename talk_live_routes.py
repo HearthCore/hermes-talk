@@ -51,7 +51,8 @@ def mount_live_routes(
                 raise failure
 
             return await task_call(raise_domain_error, request, body)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, http_exception):
+            # An already-mapped refusal keeps its own status; only unmapped failures collapse.
             raise
         except Exception:  # noqa: BLE001 - upstream auth/session details are server-only
             raise http_exception(
@@ -156,8 +157,40 @@ def mount_live_routes(
     async def live_speech(request: Request):
         require_auth(request)
         body = await read_body(request)
-        prepared = await task_call(tasks.speech, request, body)
-        return await task_call(lambda _request, value: speech_context(value), request, prepared)
+        if body.get("replay") is not True:
+            prepared = await task_call(tasks.speech, request, body)
+            return await task_call(
+                lambda _request, value: speech_context(value), request, prepared
+            )
+
+        async def replay():
+            """Re-announce one terminal result into the exact bound Live session.
+
+            Authorization is proven twice (the binding fence here, ``authorize`` inside
+            ``present``); result ownership and replay eligibility are ``tasks.speech``'s;
+            the persisted ``submitting`` receipt fences the send. No typed input, coordinator
+            decision, ledger row or staged interaction is involved.
+            """
+            if (body.get("presentation_protocol") != 1
+                    or body.get("playback_supported") is not False):
+                raise DashboardTaskError("invalid_event", 400)
+            binding = await registry.binding(request, body, refresh=True)
+            request_body = {key: body.get(key) for key in (
+                "connection_id", "generation", "event_id", "timing",
+                "presentation_protocol", "playback_supported", "replay",
+            )}
+            prepared = await task_call(tasks.speech, request, request_body)
+            speech = await task_call(
+                lambda _request, value: speech_context(value), request, prepared
+            )
+            if not speech.get("speak"):
+                return speech
+            submitted = await binding.present(speech)
+            if submitted is None:
+                return {**speech, "speak": False, "reason": "dispatch_refused"}
+            return {**speech, "presentation": submitted.get("presentation")}
+
+        return await invoke(replay(), request, body)
 
     handlers = (
         live_session,
