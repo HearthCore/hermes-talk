@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from subprocess import run
 
@@ -450,6 +451,41 @@ const button = (tree, text) => nodes(tree).find((node) => node.tag === "button" 
 """
 
 
+def test_token_submission_refreshes_status_and_authorized_targets():
+    script = PAGE_HARNESS + r"""
+(async()=>{
+const baseFetch=fetchOverride, tokens=new Map();
+window.sessionStorage={getItem:key=>tokens.get(key)||'',
+  setItem:(key,value)=>tokens.set(key,value),removeItem:key=>tokens.delete(key)};
+fetchOverride=(url,body,opts)=>{
+  if(opts.headers['x-talk-token']!=='fixture-token') throw new Error('401: Talk token required');
+  return baseFetch(url,body);
+};
+render(); await drain();
+let tree=render();
+assert(button(tree,'Use token'),'Auth refusal must expose token entry');
+assert(label(tree).includes('Target list unavailable'));
+nodes(tree).find(node=>node.props.placeholder==='TALK_DASHBOARD_TOKEN')
+  .props.onChange({target:{value:'fixture-token'}});
+tree=render();button(tree,'Use token').props.onClick();
+render();await drain();tree=render();
+assert.equal(button(tree,'Use token'),undefined,'Accepted token should dismiss prompt');
+assert(!label(tree).includes('Target list unavailable'),'Task catalog must recover with status');
+assert(label(tree).includes('Selected task'),'Authorized tasks must load without a second click');
+assert.equal(requests.filter(row=>row.url.endsWith('/targets')).length,2);
+assert.equal(transports.length,0,'Token submission must not start audio');
+process.exit(0);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 TARGET_PAGE_HARNESS = PAGE_HARNESS + r"""
 const baseFetch = fetchOverride, connections = new Map();
 const targetRows = [
@@ -695,6 +731,46 @@ process.exit(0);
         text=True, timeout=NODE_TIMEOUT_S, check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("origin", [
+    "file:///C:/Hermes/resources/app.asar.unpacked/dist/index.html",
+    "http://127.0.0.1:8080/",
+    "https://hermes.example/dashboard?private=value#fragment",
+])
+def test_session_switch_and_return_page_references_match_backend(origin):
+    from talk_dashboard_tasks import DashboardTasks
+
+    script = TARGET_PAGE_HARNESS + "\nwindow.location.href = " + json.dumps(origin) + r""";
+(async () => {
+await bootA();
+choose("Task or Bot target", "b"); click("Switch target"); await readyPage();
+click("Return to previous (1)"); await readyPage();
+const admissions = requests.filter(row => /\/(session|switch)$/.test(row.url));
+assert.equal(admissions.length, 3);
+assert.equal(latestTransport.session.task.target_id, "a");
+console.log(JSON.stringify(admissions.map(row => ({
+  route: row.url.endsWith('/session') ? 'session' : 'switch',
+  payload: row.url.endsWith('/session') ? row.body.task : row.body,
+}))));
+listeners.pagehide(); process.exit(0);
+})().catch(error => {console.error(error); process.exit(1);});
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)], cwd=ROOT, capture_output=True,
+        text=True, timeout=NODE_TIMEOUT_S, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    admissions = json.loads(completed.stdout)
+    for admission in admissions:
+        payload = admission["payload"]
+        reference = DashboardTasks._page_reference(payload.get("page_reference"))
+        if origin.startswith("file:"):
+            assert "page_reference" not in payload
+            assert reference["state"] == "unavailable"
+        else:
+            assert reference["state"] == "referenced"
+            assert reference["url"] == origin.split("?", 1)[0]
 
 
 def test_dashboard_task_picker_rendering_and_page_generation_fences():

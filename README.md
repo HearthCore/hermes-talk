@@ -15,6 +15,13 @@
 
 Talk runs in the terminal (`hermes talk`), Discord voice (`/talk join`), and the Hermes dashboard **Talk** tab. It calls the host's tools, delegates background work while you keep talking, reports results, and handles current approval requests. Provider support differs by surface; see the tables below. Built as a plug-in for [Hermes Agent](https://github.com/NousResearch/hermes-agent).
 
+**Desktop integration:** open a conversation → **Talk** → **Connect**.
+Talk appears in the top bar and beside the composer, selects the current conversation
+and authenticates automatically with the local Desktop backend. The small popover
+disappears after connection; Talk status and Stop stay available beside the composer.
+It requires the matching host microphone and request-routing update; installing
+the plugin alone cannot add those host capabilities. See [Desktop setup](docs/DESKTOP.md).
+
 **New in 0.18.0:** GPT-Live with separate subscription and API billing, plus Codex workers attached to a selected Hermes task. Subscription is the default, with no automatic paid fallback. These features require the compatible task-worker host. Setup, controls and verification: [GPT-Live and task workers](docs/GPT-LIVE.md).
 
 ```bash
@@ -98,6 +105,7 @@ Full runbook, wire canary included: [docs/OPERATING.md](docs/OPERATING.md#verify
 | Inside a Hermes session | `/talk` | same as terminal | the one surface with an **attached** agent loop — memory lookups and delegation answer inline |
 | Discord voice channel | `/voice join`, then `/talk join [TARGET]` | borrows the host's voice connection | OpenAI Realtime, Grok, cascade; GPT-Live with a verified operator and room audience |
 | Dashboard **Talk** tab | `hermes dashboard`, select a task, **Start** | browser WebRTC, no local audio drivers | OpenAI Realtime, cascade, GPT-Live; host authentication and the Talk route gate apply |
+| Desktop **Talk** composer action | compatible Desktop host, open a conversation, **Talk** | renderer WebRTC with exclusive microphone ownership | GPT-Live and OpenAI Realtime; see [Desktop requirements](docs/DESKTOP.md) |
 
 ## Providers
 
