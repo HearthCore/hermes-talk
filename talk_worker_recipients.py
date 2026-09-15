@@ -178,7 +178,7 @@ class TalkWorkerRecipients:
             not isinstance(body, dict)
             or body.get("name") != "send_agent_message"
             or not isinstance(body.get("arguments"), dict)
-            or set(body["arguments"]) - {"message", "app"}
+            or set(body["arguments"]) - {"message", "app", "recipient_id", "task_id", "host_id"}
             or body["arguments"].get("app", APP) != APP
         ):
             raise DashboardTaskError("invalid_event", 400)

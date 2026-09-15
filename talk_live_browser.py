@@ -532,42 +532,61 @@ class BrowserBinding:
             speech = speech_context(prepared)
             if not speech.get("speak"):
                 continue
-            receipt = {
-                **self.context,
-                "event_id": speech["event_id"],
-                "attempt_id": speech["attempt_id"],
-            }
-            try:
-                await self.authorize(write=True)
-                delegation_id = self.job_delegations.get(str(speech["run_id"]))
-                command = (rt.SubmitDelegationResult(delegation_id, speech["content"])
-                           if delegation_id else
-                           rt.AppendLiveContext(speech["content"], kind="message"))
-                async with self.send_lock:
-                    dispatch = await asyncio.to_thread(
-                        self.registry.manager.speech_receipt, self.lease,
-                        {**receipt, "state": "submitting"},
-                    )
-                    if dispatch.get("ok") is not True:
-                        continue
-                    self.speech_attempts[speech["event_id"]] = receipt
-                    await self.authorize(write=True)
-                    if self.closed or self.closing:
-                        raise asyncio.CancelledError
-                    await self.session.send([command])
-                await asyncio.to_thread(
+            await self.present(
+                speech, delegation_id=self.job_delegations.get(str(speech["run_id"]))
+            )
+
+    def open_delegation(self, run_id):
+        """The provider delegation still awaiting this job's result, or None once retired."""
+        delegation_id = self.job_delegations.get(str(run_id))
+        if delegation_id is None or delegation_id in self.retired:
+            return None
+        return delegation_id
+
+    async def present(self, speech, *, delegation_id=None):
+        """Announce one prepared speech into this exact binding, fenced by its attempt receipt.
+
+        The persisted ``submitting`` receipt is the dispatch fence: a refusal sends nothing
+        and returns ``None``. After the send the attempt is ``context_submitted`` and that
+        receipt reply is returned; any failure in between persists ``unknown`` for this
+        attempt and re-raises, and nothing retries it.
+        """
+        receipt = {
+            **self.context,
+            "event_id": speech["event_id"],
+            "attempt_id": speech["attempt_id"],
+        }
+        try:
+            await self.authorize(write=True)
+            command = (rt.SubmitDelegationResult(delegation_id, speech["content"])
+                       if delegation_id else
+                       rt.AppendLiveContext(speech["content"], kind="message"))
+            async with self.send_lock:
+                dispatch = await asyncio.to_thread(
                     self.registry.manager.speech_receipt, self.lease,
-                    {**receipt, "state": "context_submitted"},
+                    {**receipt, "state": "submitting"},
                 )
-            except BaseException:
-                self.speech_attempts.pop(speech["event_id"], None)
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(
-                        self.registry.manager.speech_receipt,
-                        self.lease,
-                        {**receipt, "state": "unknown"},
-                    )
-                raise
+                if dispatch.get("ok") is not True:
+                    return None
+                self.speech_attempts[speech["event_id"]] = receipt
+                await self.authorize(write=True)
+                if self.closed or self.closing:
+                    raise asyncio.CancelledError
+                await self.session.send([command])
+            submitted = await asyncio.to_thread(
+                self.registry.manager.speech_receipt, self.lease,
+                {**receipt, "state": "context_submitted"},
+            )
+        except BaseException:
+            self.speech_attempts.pop(speech["event_id"], None)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    self.registry.manager.speech_receipt,
+                    self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+            raise
+        return submitted
 
     async def watch_lease(self):
         try:

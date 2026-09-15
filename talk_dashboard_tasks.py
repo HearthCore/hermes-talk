@@ -678,6 +678,12 @@ class DashboardTasks:
         if name == "send_agent_message":
             target = self.recipients._store(bound).snapshot()["selected"]
             if target and target["app"] == "codex_worker":
+                expected = self.recipients.identity_of(arguments)
+                if expected is not None:
+                    # The steer target is resolved from this snapshot, so a captured send
+                    # naming a recipient must still name this worker. Every other target is
+                    # fenced inside RecipientStore.prepare, in the binding transaction.
+                    self.recipients.require_identity(target, expected)
                 body = TalkWorkerRecipients(bound).steering_body(target, body)
                 name, arguments = body["name"], body["arguments"]
         child_context = self.instructions(bound)[:32000] if name in CHILD_TOOLS else ""
@@ -780,6 +786,8 @@ class DashboardTasks:
             output = control_output(action)
         elif name == "resolve_approval":
             action, output = self._resolve_approval(request, body, bound, action)
+        elif name == "stop_work":
+            action, output = self._stop_work(bound, action, arguments)
         elif name == "set_update_preference":
             action = bound.stages.set_update_preference(
                 bound.token, action["run_id"], bound.events
@@ -840,6 +848,32 @@ class DashboardTasks:
                 raise
         if saved is None:
             raise DashboardTaskError("connection_stale", 409)
+        return saved, output
+
+    def _stop_work(self, bound, action, arguments):
+        """One stop POST per action. A torn response leaves ``submitting``; retries observe.
+
+        The action row owns the pre-dispatch state: ``prepared`` has posted nothing,
+        ``submitting`` may have reached the host, ``returned`` carries the host's reply.
+        A retry never posts a second stop; it reads the run and reports it unconfirmed.
+        """
+        if action["state"] == "returned":
+            return action, action.get("output") or json.dumps({"stopped": "returned"})
+        job = bound.stages.action(bound.token, arguments.get("run_id"))
+        if not job.get("api_run_id"):
+            raise DashboardTaskError("result_unavailable", 409)
+        if action["state"] == "submitting":
+            run = bound.gateway.run(job["api_run_id"])
+            output = json.dumps({
+                "run_id": arguments.get("run_id"), "status": run.get("status"),
+                "stop": "unconfirmed",
+            })
+            return bound.stages.update_action(bound.token, action["run_id"], output=output), output
+        action = bound.stages.update_action(bound.token, action["run_id"], state="submitting")
+        output = json.dumps(bound.gateway.stop(job["api_run_id"]))
+        saved = bound.stages.update_action(
+            bound.token, action["run_id"], state="returned", output=output
+        )
         return saved, output
 
     def _dispatch(self, bound, action, *, recover=False):
@@ -909,8 +943,6 @@ class DashboardTasks:
             return json.dumps(self._recipient_result(request, body, bound, action))
         if not action.get("api_run_id"):
             raise DashboardTaskError("result_unavailable", 409)
-        if name == "stop_work":
-            return json.dumps(bound.gateway.stop(action["api_run_id"]))
         result = bound.gateway.run(action["api_run_id"])
         return json.dumps(
             {"run_id": run_id, "status": result.get("status"), "output": result.get("output", "")}
@@ -1051,7 +1083,7 @@ class DashboardTasks:
                     job["approval"] = {
                         "state": "current",
                         "approvals": approvals["approvals"],
-                        "actionable": False,
+                        "actionable": bool(approvals["approvals"]),
                     }
                 except DashboardTaskError as exc:
                     job["approval"] = {
