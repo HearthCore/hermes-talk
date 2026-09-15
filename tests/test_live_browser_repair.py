@@ -185,7 +185,7 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
         prepared = await asyncio.to_thread(
             manager.speech, binding.lease,
             {**binding.context, "event_id": state["announcements"][0]["event_id"],
-             "timing": quiet(2)})
+             "timing": quiet(2), "presentation_protocol": 1, "playback_supported": False})
         assert prepared["speak"]
         record_property("completion_host_sqlite_projection_ms",
                         round((time.perf_counter() - projected_at) * 1000, 2))
@@ -209,7 +209,8 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
                 projected.setattr(manager, "result", lambda *_: result)
                 projected.setattr(manager, "speech", lambda *_: prepared)
                 projected.setattr(
-                    manager, "speech_receipt", lambda request, body: receipts.append(body))
+                    manager, "speech_receipt",
+                    lambda request, body: (receipts.append(body), {"ok": True})[1])
                 recorded = time.perf_counter()
                 response = await asyncio.wait_for(binding.poll(binding.sequence, quiet(2)), 1)
                 eligible_ms = (time.perf_counter() - recorded) * 1000
@@ -224,7 +225,9 @@ def test_queued_capture_does_not_delay_exact_job_completion_or_repeat_its_result
             assert any(event.get("result", {}).get("output") == "Verified worker result"
                        for event in response["events"])
             assert not binding.active_jobs
-            assert len(receipts) == 1 and receipts[0]["state"] == "sent"
+            assert [receipt["state"] for receipt in receipts] == [
+                "submitting", "context_submitted",
+            ]
             assert receipts[0]["event_id"] == prepared["event_id"]
             release.set()
             receipt_at = time.perf_counter()

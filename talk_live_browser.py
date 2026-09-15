@@ -85,6 +85,8 @@ class BrowserBinding:
         self.operations = {}
         self.deliveries = {}
         self.delivered = set()
+        self.presentations = {}
+        self.speech_attempts = {}
         self.typed_pending = set()
         self.job_delegations = {}
         self.closing = False
@@ -143,7 +145,7 @@ class BrowserBinding:
                 elif isinstance(event, rt.DelegationRetired):
                     self.retired.add(event.delegation_id)
                     # Speech interruption cannot retire an accepted Hermes operation.
-                    self.emit("delivery", state="interrupted")
+                    await self.retire_presentations(delegation_id=event.delegation_id)
                 elif isinstance(event, rt.ProviderFailure):
                     await self.fail("GPT-Live rejected a session event. Rejoin the task.")
                     return
@@ -293,7 +295,8 @@ class BrowserBinding:
                 result = current.get("result")
                 if not isinstance(result, dict):
                     raise DashboardTaskError("gateway_response_invalid", 502)
-                return {**result, "operation_id": operation, "operation_state": state}
+                return {**result, "operation_id": operation, "operation_state": state,
+                        "presentation": current.get("presentation")}
             if state not in {"admitted", "deciding", "dispatching"}:
                 raise DashboardTaskError("gateway_response_invalid", 502)
             await asyncio.sleep(OPERATION_POLL_SECONDS)
@@ -301,10 +304,10 @@ class BrowserBinding:
                 self.registry.coordinator.operation, self.lease, self.body(operation_id=operation),
             )
 
-    async def deliver(self, key, commands, *, delegation_id=None):
+    async def deliver(self, key, commands, *, delegation_id=None, operation_id=None):
         if key in self.delivered:
             return
-        self.deliveries.setdefault(key, (commands, delegation_id))
+        self.deliveries.setdefault(key, (commands, delegation_id, operation_id))
         if delegation_id in self.retired:
             return
         async with self.send_lock:
@@ -313,12 +316,58 @@ class BrowserBinding:
             await self.authorize(write=True)
             if self.closed or self.closing:
                 return
-            await self.session.send(commands)
             self.deliveries.pop(key, None)
             self.delivered.add(key)
-            self.emit("delivery", operation_id=key, state="sent", playback_confirmed=False)
+            receipt = None
+            if operation_id is not None:
+                prepared = await asyncio.to_thread(
+                    self.registry.coordinator.presentation, self.lease,
+                    self.body(operation_id=operation_id, state="submitting"),
+                )
+                if prepared.get("ok") is not True or not prepared.get("speak"):
+                    return
+                receipt = self.body(operation_id=operation_id,
+                                    attempt_id=prepared["presentation"]["attempt_id"])
+                self.presentations[operation_id] = (receipt, delegation_id)
+            try:
+                await self.authorize(write=True)
+                if self.closed or self.closing:
+                    raise asyncio.CancelledError
+                await self.session.send(commands)
+                if receipt is not None:
+                    submitted = await asyncio.to_thread(
+                        self.registry.coordinator.presentation, self.lease,
+                        {**receipt, "state": "context_submitted"},
+                    )
+                    self.emit("delivery", operation_id=key, state="context_submitted",
+                              presentation=submitted["presentation"], playback_confirmed=False)
+                else:
+                    self.emit("delivery", operation_id=key, state="context_submitted",
+                              playback_confirmed=False)
+            except BaseException:
+                if receipt is not None:
+                    await self.retire_presentations(operation_id=operation_id)
+                raise
+
+    async def retire_presentations(self, *, operation_id=None, delegation_id=None):
+        for key, (receipt, delegation) in list(self.presentations.items()):
+            if operation_id is not None and key != operation_id:
+                continue
+            if delegation_id is not None and delegation != delegation_id:
+                continue
+            self.presentations.pop(key, None)
+            with contextlib.suppress(Exception):
+                retired = await asyncio.to_thread(
+                    self.registry.coordinator.presentation, self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+                self.emit("delivery", operation_id=key, state="unknown",
+                          presentation=retired["presentation"], playback_confirmed=False)
 
     async def publish_result(self, result, *, delegation_id=None, input_id=None):
+        await self.authorize()
+        if self.closed or self.closing:
+            return
         self.result_event(result)
         run_id = (result.get("action") or {}).get("run_id")
         if run_id is not None:
@@ -329,7 +378,8 @@ class BrowserBinding:
         command = (rt.SubmitDelegationResult(delegation_id, text) if delegation_id is not None
                    else rt.AppendLiveContext(text, kind="message"))
         await self.deliver(result.get("operation_id") or delegation_id or input_id,
-                           [command], delegation_id=delegation_id)
+                           [command], delegation_id=delegation_id,
+                           operation_id=result.get("operation_id"))
 
     async def decide(self, delegation_id, body):
         try:
@@ -350,8 +400,14 @@ class BrowserBinding:
                 await self.fail("Live task decision failed. Inspect the task before retrying.")
 
     def result_event(self, result):
+        operation_id = result.get("operation_id")
+        if operation_id is not None:
+            key = ("operation", operation_id)
+            if key in self.results_seen:
+                return
+            self.results_seen.add(key)
         values = {key: result[key] for key in (
-            "output", "action", "selection", "operation_id", "operation_state",
+            "output", "action", "selection", "operation_id", "operation_state", "presentation",
         ) if key in result}
         action = result.get("action") or {}
         if action.get("run_id") is not None:
@@ -434,7 +490,10 @@ class BrowserBinding:
         return {"ok": True, "events": [event for event, _ in self.events], "cursor": self.sequence}
 
     async def proactive(self, timing):
-        await self.authorize()
+        bound = await self.authorize()
+        if timing is not None:
+            with self.registry.manager._lock:
+                bound.speech_timing.observe(bound.token, timing)
         state = await asyncio.to_thread(self.registry.manager.state, self.lease, self.context)
         self.active_jobs = {
             str(job["run_id"]) for job in state.get("jobs", [])
@@ -457,15 +516,18 @@ class BrowserBinding:
             self.results_seen.add(key)
         if timing is None:
             return
-        if not any(value for key, value in timing.items() if key != "sequence"):
+        if bound.speech_timing.ready(bound.token):
             self.retired.clear()
-            for key, (commands, delegation_id) in list(self.deliveries.items()):
-                await self.deliver(key, commands, delegation_id=delegation_id)
+            for key, (commands, delegation_id, operation_id) in list(self.deliveries.items())[:1]:
+                await self.deliver(key, commands, delegation_id=delegation_id,
+                                   operation_id=operation_id)
+                return
         for announcement in state.get("announcements", [])[:1]:
             prepared = await asyncio.to_thread(
                 self.registry.manager.speech,
                 self.lease,
-                {**self.context, "event_id": announcement["event_id"], "timing": timing},
+                {**self.context, "event_id": announcement["event_id"], "timing": timing,
+                 "presentation_protocol": 1, "playback_supported": False},
             )
             speech = speech_context(prepared)
             if not speech.get("speak"):
@@ -482,8 +544,23 @@ class BrowserBinding:
                            if delegation_id else
                            rt.AppendLiveContext(speech["content"], kind="message"))
                 async with self.send_lock:
+                    dispatch = await asyncio.to_thread(
+                        self.registry.manager.speech_receipt, self.lease,
+                        {**receipt, "state": "submitting"},
+                    )
+                    if dispatch.get("ok") is not True:
+                        continue
+                    self.speech_attempts[speech["event_id"]] = receipt
+                    await self.authorize(write=True)
+                    if self.closed or self.closing:
+                        raise asyncio.CancelledError
                     await self.session.send([command])
+                await asyncio.to_thread(
+                    self.registry.manager.speech_receipt, self.lease,
+                    {**receipt, "state": "context_submitted"},
+                )
             except BaseException:
+                self.speech_attempts.pop(speech["event_id"], None)
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         self.registry.manager.speech_receipt,
@@ -491,9 +568,6 @@ class BrowserBinding:
                         {**receipt, "state": "unknown"},
                     )
                 raise
-            await asyncio.to_thread(
-                self.registry.manager.speech_receipt, self.lease, {**receipt, "state": "sent"}
-            )
 
     async def watch_lease(self):
         try:
@@ -519,6 +593,14 @@ class BrowserBinding:
         if self.closed or self.closing:
             return
         self.closing = True
+        await self.retire_presentations()
+        for receipt in list(self.speech_attempts.values()):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    self.registry.manager.speech_receipt, self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+        self.speech_attempts.clear()
         with contextlib.suppress(Exception):
             async with asyncio.timeout(5):
                 await self.flush_capture()
