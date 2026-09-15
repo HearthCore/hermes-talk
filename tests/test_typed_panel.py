@@ -96,6 +96,28 @@ assert(!requests.some(row=>row.url.endsWith('/session')||row.url.endsWith('/live
 """)
 
 
+def test_owner_message_through_text_input_settles_via_operation_polling(source_bundle):
+    """With the explicit-operation descriptor present, an owner message rides /text/input;
+    its async admission names an operation, and the panel settles it through the same
+    /live/operation polling the provider-free typed path uses."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval']};
+actionOverride=body=>({ok:true,input_id:body.input_id,operation:body.operation,state:'queued',
+  operation_id:'operation-'+body.input_id});
+let props=await boot();props.setTyped('hello owner');props=present();
+assert.equal(props.canSendTyped,true);await props.sendTyped();props=present();
+const input=requests.find(row=>row.url.endsWith('/text/input')).body;
+assert.equal(input.operation,'message');assert.equal(input.recipient,undefined);
+assert(!requests.some(row=>row.url.endsWith('/live/typed')));
+const polled=requests.find(row=>row.url.includes('/live/operation?'));
+assert(polled,'the named operation must be polled');
+assert(polled.url.includes('operation_id=operation-'+input.input_id));
+assert.equal(props.typed,'');assert.equal(props.transcript.at(-1).text,'Recorded reply');
+assert.equal(transports.length,0);
+""")
+
+
 def test_send_captures_once_and_keeps_new_draft_during_late_receipt(source_bundle):
     execute(source_bundle, r"""
 let finish;typedOverride=body=>new Promise(resolve=>{finish=()=>resolve({ok:true,

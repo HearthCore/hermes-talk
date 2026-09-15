@@ -2644,6 +2644,13 @@ function createTalkSurface(SDK) {
           if (current() && addressedEpoch === recipientEpoch.current) setActionReceipt(receipt);
           sent = ["queued", "posted", "accepted", "completed", "saved"].includes(receipt.state);
           if (!sent && current()) setInputError("Input delivery is " + receipt.state + ". Inspect the task before retrying.");
+          // An owner message admitted asynchronously settles through the same /live/operation
+          // polling the provider-free typed path uses; the reply names the operation to watch.
+          if (sent && typeof receipt.operation_id === "string" && receipt.operation_id) {
+            if (!transport.typedOperations) transport.typedOperations = new Map();
+            transport.typedOperations.set(receipt.operation_id, body.input_id);
+            if (current()) await pollTypedOperations(transport);
+          }
         }
         if (current() && addressedEpoch === recipientEpoch.current && sent && draft.revision === draftRef.current.revision) {
           setTyped("");
