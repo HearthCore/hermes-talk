@@ -11,6 +11,18 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.19.1] — 2026-09-15
+
+### Changed
+- The Codex subscription lane is read-only. It borrows Hermes' own Codex login
+  first through `hermes_cli.auth_codex.resolve_codex_runtime_credentials`, so
+  Hermes stays the single owner of that token store and refreshes it under its
+  own lock. Without a Hermes login, Talk reads `~/.codex/auth.json` without ever
+  refreshing or rewriting it; an expired CLI token surfaces a `TalkAuthError`
+  pointing at `codex login`. Removed `_post_token_form`, `_write_auth_json` and
+  `_refresh_codex_credential`. Written by @teknium1 in #146 to clear the one
+  catalog-admission blocker on NousResearch/hermes-agent#108798.
+
 ## [0.19.0] — 2026-09-12
 
 ### Changed
