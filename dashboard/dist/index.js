@@ -2093,7 +2093,10 @@ function createTalkSurface(SDK) {
       const transport = transportRef.current;
       if (transport && transport.task) {
         await transport.task.refresh();
-        if (transport.textOnly) await pollTypedOperations(transport);
+        // Pending typed operations settle through this poll whether or not the
+        // transport is text-only: an owner message admitted during a voice
+        // session names an operation on a transport whose textOnly is false.
+        if (transport.typedOperations?.size > 0) await pollTypedOperations(transport);
         return;
       }
       try {
@@ -2520,6 +2523,19 @@ function createTalkSurface(SDK) {
 
     async function setRecipient(id) {
       if (recipientBusy.current) return false;
+      // Owner addressing is the default, not a host recipient: clearing it is
+      // local state only. Bumping the epoch drops receipts still in flight for
+      // the recipient being left. The voice owner is untouched either way.
+      if (!id) {
+        recipientEpoch.current++;
+        confirmedRecipient.current = null;
+        updateRecipient("");
+        setSelectedJob(null);
+        updateOperation("message");
+        setRecipientHistory(null);
+        setRecipientError("");
+        return true;
+      }
       const row = recipients.find(item => item.recipient_id === id);
       if (!row || row.available === false) return false;
       const target = recipientIdentity(row);
@@ -2587,6 +2603,12 @@ function createTalkSurface(SDK) {
     const selectedRecipientRow = recipients.find(row => row.recipient_id === selectedRecipient);
     const selectedJobRow = taskState?.jobs?.find(job => job.run_id === selectedJob);
     const operationSupported = inputCapabilities?.operations?.includes(recipientOperation) === true;
+    /**
+     * Owner text only leaves /live/typed for /text/input when the descriptor
+     * actually declares "message". A descriptor that omits it (cancel/approval
+     * only) routes owner text exactly as an absent descriptor does.
+     */
+    const ownerMessageSupported = inputCapabilities?.operations?.includes("message") === true;
     const recipientCanSend = selectedRecipientRow?.send_agent_message === "direct" &&
       selectedRecipientRow.proven_control !== "none" && selectedRecipientRow.read_only !== true &&
       selectedRecipientRow.available !== false && sameRecipient(selectedRecipientRow, confirmedRecipient.current);
@@ -2612,11 +2634,11 @@ function createTalkSurface(SDK) {
       setInputError("");
       let sent = false;
       try {
-        const transport = legacyText && !inputCapabilities ? transportRef.current : await ensureTextBinding();
+        const transport = legacyText && !ownerMessageSupported ? transportRef.current : await ensureTextBinding();
         if (!current()) return false;
-        if (legacyText && !inputCapabilities) {
+        if (legacyText && !ownerMessageSupported) {
           sent = await transport.sendTyped(draft.text);
-        } else if (ownerText && !inputCapabilities) {
+        } else if (ownerText && !ownerMessageSupported) {
           const signature = JSON.stringify([draft.revision, transport.task.context]);
           if (submissionRef.current?.signature !== signature) submissionRef.current = { signature,
             body: { provider_session_id: captureSession.current, input_id: clientId("typed_"),
@@ -2766,10 +2788,12 @@ function createTalkSurface(SDK) {
     }
 
     async function showResult(runId) {
+      // Opening a stored result is a read. It must never mint a binding, so a
+      // click without one is inert and the control says why instead.
+      const transport = transportRef.current;
       const epoch = connectionEpoch.current;
+      if (!transport?.task) return;
       try {
-        const transport = await ensureTextBinding();
-        if (epoch !== connectionEpoch.current) return;
         const result = await transport.task.result(runId);
         if (epoch === connectionEpoch.current) setResults((prev) => Object.assign({}, prev, { [runId]: result }));
       } catch (err) { if (epoch === connectionEpoch.current) handleError(err); }
@@ -2808,6 +2832,7 @@ function createTalkSurface(SDK) {
       attachments, addAttachments, removeAttachment, attachmentsSupported: false,
       canSendTyped: Boolean(canSendTyped), inputCapabilities, inputError, actionReceipt,
       replaySupported: Boolean(transportRef.current && !transportRef.current.live && !transportRef.current.textOnly),
+      resultsReadable: Boolean(transportRef.current?.task),
       selectedJob, pendingActions, cancelJob, steerJob, answerApproval, replayResult,
       muted, sleeping, setMuted, setSleeping, appearance, setAppearance,
       audioActivity: { input: !muted && !sleeping && active && audioActivity.input,

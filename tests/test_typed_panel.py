@@ -118,6 +118,120 @@ assert.equal(transports.length,0);
 """)
 
 
+def test_owner_message_rides_typed_when_descriptor_omits_message(source_bundle):
+    """A descriptor is not a blanket degradation signal. Without "message" in its
+    operations an owner message stays on /live/typed, exactly as it does when no
+    descriptor is published at all."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['cancel','approval']};
+let props=await boot();props.setTyped('owner words');props=present();
+assert.equal(props.canSendTyped,true);await props.sendTyped();props=present();
+const typed=requests.find(row=>row.url.endsWith('/live/typed'));
+assert(typed,'owner text must ride /live/typed without a message operation');
+assert.equal(typed.body.text,'owner words');
+assert(!requests.some(row=>row.url.endsWith('/text/input')),
+  'a descriptor without "message" must not reroute owner text');
+assert.equal(props.typed,'');assert.equal(transports.length,0);
+""")
+
+
+def test_opening_a_stored_result_never_mints_a_session(source_bundle):
+    """Opening a result is a read. Without a binding it is inert — no
+    /native/attach, no prepared desktop session, no page error."""
+
+    execute(source_bundle, r"""
+let props=await boot();const before=requests.length;let prepared=0;
+const realPrepare=sdk.prepareTask;
+sdk.prepareTask=async(...args)=>{prepared++;return realPrepare(...args);};
+await props.showResult(7);props=present();
+assert.equal(prepared,0,'opening a result prepared a session');
+assert(!requests.some(row=>row.url.endsWith('/native/attach')));
+assert.equal(requests.length,before);
+assert.equal(transports.length,0);assert.equal(props.error,'');
+""")
+
+
+def test_owner_message_during_voice_settles_through_recurring_polling(source_bundle):
+    """A voice transport is not text-only, so the recurring poll must key on
+    pending typed operations instead. A pending owner admission settles on the
+    next refresh rather than hanging after a single poll."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','cancel','approval']};
+actionOverride=body=>({ok:true,input_id:body.input_id,operation:body.operation,state:'queued',
+  operation_id:'operation-'+body.input_id});
+const realTimeout=window.setTimeout;
+window.setTimeout=(fn,ms)=>realTimeout(fn,ms>=5000?4:ms);
+let polls=0;const base=fetchOverride;
+fetchOverride=(url,body,options)=>{
+  if(url.includes('/live/operation?')) {
+    const id=decodeURIComponent(url.split('operation_id=')[1]);
+    return ++polls===1 ? {ok:true,operation_id:id,state:'dispatching',pending:true}
+      : {ok:true,operation_id:id,state:'completed',pending:false,result:{output:'Recorded reply'}};
+  }
+  return base(url,body,options);
+};
+let props=await boot();await props.startTalk();props=present();
+assert.equal(transports.length,1);assert.equal(props.active,true);
+props.setTyped('owner during voice');props=present();
+assert.equal(props.canSendTyped,true);await props.sendTyped();props=present();
+assert(requests.some(row=>row.url.endsWith('/text/input')));
+assert.equal(polls,1,'the first poll must leave a pending operation unsettled');
+assert.equal(props.transcript.length,0);
+await waitFor(()=>polls>1);await drain();props=present();
+assert.equal(props.transcript.at(-1).text,'Recorded reply');
+window.setTimeout=realTimeout;
+""")
+
+
+def test_clearing_the_recipient_returns_addressing_to_the_owner(source_bundle):
+    """Owner addressing is the default, not a host recipient. Clearing a
+    committed recipient is local state only and never selects on a host."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval']};
+await (await boot()).refreshRecipients();
+assert.equal(await present().setRecipient('b'),true);
+assert.equal(present().selectedRecipient,'b');
+const selects=()=>requests.filter(row=>row.url.endsWith('/recipients/select'));
+assert.equal(selects().length,1);
+assert.equal(await present().setRecipient(''),true);
+let props=present();
+assert.equal(props.selectedRecipient,'');
+assert.equal(props.recipientOperation,'message');
+assert.equal(selects().length,1,'owner addressing must not be selected on a host');
+props.setTyped('back to the owner');props=present();
+assert.equal(props.canSendTyped,true);await props.sendTyped();
+const input=requests.filter(row=>row.url.endsWith('/text/input')).at(-1).body;
+assert.equal(input.operation,'message');
+assert.equal(input.recipient,undefined,'an owner message must carry no recipient');
+assert.equal(present().typed,'');
+""")
+
+
+def test_start_worker_send_is_never_addressed_to_a_recipient(source_bundle):
+    """start_worker starts a Talk-owned worker on the pinned task. Even with a
+    recipient committed, the dispatched body carries none — the panel must not
+    claim otherwise."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval']};
+await (await boot()).refreshRecipients();
+assert.equal(await present().setRecipient('b'),true);
+present().setRecipientOperation('start_worker');
+let props=present();
+assert.equal(props.selectedRecipient,'b');
+assert.equal(props.recipientOperation,'start_worker');
+props.setTyped('start a worker');props=present();
+assert.equal(props.canSendTyped,true);await props.sendTyped();
+const input=requests.filter(row=>row.url.endsWith('/text/input')).at(-1).body;
+assert.equal(input.operation,'start_worker');
+assert.equal(input.recipient,undefined,'a worker start must carry no recipient');
+assert.equal(present().typed,'');
+""")
+
+
 def test_send_captures_once_and_keeps_new_draft_during_late_receipt(source_bundle):
     execute(source_bundle, r"""
 let finish;typedOverride=body=>new Promise(resolve=>{finish=()=>resolve({ok:true,

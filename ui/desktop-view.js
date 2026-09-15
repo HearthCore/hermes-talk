@@ -127,6 +127,9 @@ export function DesktopTalkView(props) {
   const inputOperations = props.inputCapabilities?.operations || [];
   const recipients = (props.recipients || []).filter(row => typeof row?.recipient_id === 'string');
   const recipient = recipients.find(row => row.recipient_id === selectedRecipient);
+  // start_worker starts a Talk-owned worker on the pinned task. It is never
+  // addressed to a recipient, so the send must not display one.
+  const addressed = recipientOperation === 'start_worker' ? null : recipient;
   const matchingRecipients = recipients.filter(row => desktopTalkRecipientLabel(row).toLowerCase()
     .includes(recipientQuery.trim().toLowerCase()));
   const recipientChoices = recipient && !matchingRecipients.includes(recipient)
@@ -218,8 +221,8 @@ export function DesktopTalkView(props) {
           'Recipient unavailable · ' + selectedRecipient),
         recipientChoices.map(row => h('option', { value: row.recipient_id, key: row.recipient_id,
           disabled: row.available === false }, desktopTalkRecipientLabel(row))))),
-      recipient && h('p', { className: 'htd-text' }, desktopTalkRecipientLabel(recipient)),
-      recipient && h('p', { className: 'htd-muted' },
+      addressed && h('p', { className: 'htd-text' }, desktopTalkRecipientLabel(addressed)),
+      addressed && h('p', { className: 'htd-muted' },
         recipient.read_only ? 'Read-only history' : messageable ? 'Existing-app message available' : 'Message unavailable',
         ' · Read history: ', readable ? 'available' : 'unavailable',
         ' · Owned-job steering: ', steerable ? 'available' : 'unavailable'),
@@ -243,6 +246,8 @@ export function DesktopTalkView(props) {
       h('option', { value: 'steer', disabled: !steerable }, 'Steer owned job'))),
     recipientOperation === 'steer' && selectedJob && h('p', { className: 'htd-text' },
       'Steering job ', String(selectedJob.run_id), ' · ', selectedJob.goal),
+    recipientOperation === 'start_worker' && h('p', { className: 'htd-text' },
+      'Starts a new worker on this task. This send is not addressed to a recipient.'),
     recipientOperation === 'read' && h('div', null,
       button(recipientLoading ? 'Reading…' : 'Read conversation', () => void readRecipient(),
         { disabled: !readable || !readRecipient || recipientLoading || sending || busy })),
@@ -359,7 +364,11 @@ export function DesktopTalkView(props) {
         job.result_available && !props.results?.[job.run_id] && h('div', null,
           button('Show result', () => void showResult(job.run_id),
             { variant: 'outline', size: 'sm', disabled: !showResult || switching ||
+              props.resultsReadable === false ||
               !!pendingActions['result:' + job.run_id]?.pending })),
+        job.result_available && !props.results?.[job.run_id] && props.resultsReadable === false &&
+          h('p', { className: 'htd-muted' },
+            'Connect this conversation to open the stored result.'),
         actionError('cancel:' + job.run_id, 'The job could not be cancelled. Try again.'),
         actionError('result:' + job.run_id, 'The result could not be loaded. Try again.'),
         presentation && actionError('replay:' + presentation.event_id, 'The summary could not be replayed. Try again.'));

@@ -128,7 +128,12 @@ assert.equal(button(tree,'Send').props.disabled,true);
 tree=render({recipients:[readOnly,writable],recipientOperation:'start_worker',
   inputCapabilities:{operations:[]}});
 assert.equal(button(tree,'Send').props.disabled,true);
-tree=render({inputCapabilities:{operations:['start_worker']}});submit(tree);
+tree=render({inputCapabilities:{operations:['start_worker']}});
+assert(text(tree).includes('Starts a new worker on this task.'));
+assert.equal(nodes(tree).filter(node=>node.type==='p'&&
+  text(node).includes('host-c · task-c · live-a')).length,0,
+  'start_worker is not addressed to a recipient');
+submit(tree);
 assert.equal(calls.at(-1)[3],'start_worker');
 tree=render({recipientOperation:'steer'});
 assert.equal(button(tree,'Send').props.disabled,true);
@@ -296,6 +301,10 @@ tree=render({taskState:{jobs:[{...job,presentation:{...job.presentation,state:'p
   playback_started:true,playback_finished:true}}]}});
 assert(text(tree).includes('Summary playback finished'));
 assert.equal(calls.filter(call=>call[0]==='send'||call[0]==='start').length,0);
+tree=render({taskState:{jobs:[job]},results:{},resultsReadable:false});
+assert.equal(button(tree,'Show result').props.disabled,true);
+assert(text(tree).includes('Connect this conversation to open the stored result.'));
+assert.deepEqual(calls,[['result',7],['replay','event-result']]);
 """)
 
 
