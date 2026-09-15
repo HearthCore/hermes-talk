@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from dataclasses import dataclass
 from typing import ClassVar
 
 try:
@@ -251,6 +252,13 @@ class _PulseWebRtcAudio:
         self._sink_name = None
 
 
+@dataclass(frozen=True)
+class PlaybackProgress:
+    consumed_bytes: int
+    discarded_bytes: int
+    pending: bool
+
+
 class DuplexAudio:
     """Full-duplex pcm16 capture and playback over PortAudio."""
 
@@ -267,6 +275,8 @@ class DuplexAudio:
         self._played_item_id: str | None = None
         self._dropped_input_blocks = 0
         self._dropped_playback_bytes = 0
+        self._consumed_playback_bytes = 0
+        self._discarded_playback_bytes = 0
         self._played_frames = 0
         self._output_level = 0.0
         self._input_paused = False
@@ -407,6 +417,7 @@ class DuplexAudio:
             taken = data[:remaining]
             parts.append(taken)
             self._queued_playback_bytes -= len(taken)
+            self._consumed_playback_bytes += len(taken)
             played_frames = len(taken) // FRAME_BYTES
             if played_frames:
                 if item_id != self._played_item_id:
@@ -499,6 +510,7 @@ class DuplexAudio:
                 except queue.Empty:
                     break
             self._residual = None
+            self._discarded_playback_bytes += self._queued_playback_bytes
             self._queued_playback_bytes = 0
             boundary = (
                 self._played_item_id,
@@ -527,6 +539,15 @@ class DuplexAudio:
 
         with self._lock:
             return self._queued_playback_bytes > 0
+
+    @property
+    def playback_progress(self) -> PlaybackProgress:
+        with self._lock:
+            return PlaybackProgress(
+                self._consumed_playback_bytes,
+                self._discarded_playback_bytes + self._dropped_playback_bytes,
+                self._queued_playback_bytes > 0,
+            )
 
     @property
     def played_ms(self) -> int:
@@ -564,6 +585,7 @@ __all__ = [
     "SAMPLE_RATE",
     "SAMPLE_WIDTH",
     "DuplexAudio",
+    "PlaybackProgress",
     "TalkAudioError",
     "audio_available",
     "import_sounddevice",

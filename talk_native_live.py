@@ -615,11 +615,18 @@ class NativeLiveTaskController(NativeTaskController):
             value for key, value in self.timing().items() if key != "sequence"
         )
 
-    async def _send_synthetic(self, commands, *, quiet=False, source_sequence=None):
+    async def _send_synthetic(self, commands, *, quiet=False, source_sequence=None, receipt=None):
         async with self.send_lock:
             self.guard()
             if quiet and not self._quiet():
+                if receipt is not None:
+                    await self._speech_receipt(receipt, "deferred")
                 return False
+            if receipt is not None:
+                await self._speech_receipt(receipt, "submitting")
+                if not self._quiet():
+                    await self._speech_receipt(receipt, "unknown")
+                    return False
             self.synthetic_sequence = max(
                 self.synthetic_sequence,
                 self.fragment_sequence if source_sequence is None else source_sequence,
@@ -639,8 +646,18 @@ class NativeLiveTaskController(NativeTaskController):
                 for command in commands
             ):
                 self.provider_response_active = True
-            await self.session.send(tuple(commands))
-            self.guard()
+            try:
+                self.guard()
+                await self.session.send(tuple(commands))
+                self.guard()
+                if receipt is not None:
+                    await self._speech_receipt(receipt, "context_submitted")
+                    await self._speech_receipt(receipt, "unknown")
+            except BaseException:
+                if receipt is not None and self.current:
+                    with suppress(NativeTaskError):
+                        await self._speech_receipt(receipt, "unknown")
+                raise
             return True
 
     async def _flush_updates(self):
@@ -669,32 +686,35 @@ class NativeLiveTaskController(NativeTaskController):
         else:
             self.notice({"state": "text_only", "reason": "provider_context_append_unsupported"})
 
-    async def _speak(self, candidate):
+    async def _speak(self, candidate, *, replay=False):
         if not getattr(self.session, "supports_live_context", True):
             self.notice({"state": "text_only", "reason": "provider_summary_speech_unsupported"})
-            return
+            return {"speak": False, "reason": "provider_summary_speech_unsupported"}
         speech = await self.request(
             "/live/speech",
             {
                 "event_id": candidate["event_id"],
                 "timing": self.timing(),
+                "presentation_protocol": 1,
+                "playback_supported": False,
+                "replay": replay,
             },
         )
         if speech.get("speak") is not True:
-            return
+            return speech
         commentary = speech.get("content")
         if not isinstance(commentary, str) or not commentary.strip() or len(commentary) > 4000:
             raise NativeTaskError("Live summary has no bounded server commentary")
         receipt = {"event_id": speech["event_id"], "attempt_id": speech["attempt_id"]}
         if any(value for key, value in self.timing().items() if key != "sequence"):
-            await self.request("/speech/receipt", {**receipt, "state": "deferred"})
-            return
+            await self._speech_receipt(receipt, "deferred")
+            return {**speech, "speak": False}
         if speech.get("result") is not None and self.on_result is not None:
             self.on_result(speech["result"])
         sent = await self._send_synthetic(
-            [rt.AppendLiveContext(commentary, kind="message")], quiet=True
+            [rt.AppendLiveContext(commentary, kind="message")], quiet=True, receipt=receipt
         )
-        await self.request("/speech/receipt", {**receipt, "state": "sent" if sent else "deferred"})
+        return {**speech, "speak": sent}
 
     async def drain(self):
         await self.flush_captures()

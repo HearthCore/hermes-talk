@@ -441,6 +441,62 @@ def test_summary_is_isolated_and_cannot_call_tools_or_write_history(native):
     asyncio.run(scenario())
 
 
+def test_actual_http_summary_interrupt_reconnect_and_replay_preserve_original_job(native):
+    import talk_audio
+
+    async def scenario():
+        h = await native.connect()
+        await user(h, "Produce my full result")
+        await tool(h, "delegate_task", {"task": "One result"})
+        await started(h, "ack")
+        await finished(h, "ack")
+        await h.controller.refresh(announce=False)
+        host = native.fleet.hosts["local"]
+        host.jobs["remote-1"].update(
+            status="completed", output="The complete result", updated_at=105
+        )
+        h.controller.audio = talk_audio.DuplexAudio()
+        await h.controller.refresh()
+        command = h.session.responses[-1]
+        event_id = command.metadata["talk_event_id"]
+        first_attempt = command.metadata["talk_presentation_id"]
+        await started(h, "summary", request=command)
+        await h.controller.handle(rt.OutputAudio(bytes(1920), "summary-item", "summary"))
+        h.controller.audio._output_callback(bytearray(960), 480, None, None)
+        await h.controller.interrupt()
+        state = await h.controller.refresh(announce=False)
+        presentation = state["jobs"][0]["presentation"]
+        assert presentation["event_id"] == event_id and presentation["run_id"] == 1
+        assert presentation["operation_id"]
+        assert presentation["context_submitted"] and presentation["playback_started"]
+        assert presentation["interrupted"] and presentation["replay_eligible"]
+        assert not presentation["playback_finished"]
+        h2 = await native.connect()
+        h2.controller.audio = talk_audio.DuplexAudio()
+        await h2.controller.refresh()
+        assert not h2.session.responses
+        replay = await h2.controller.command("/replay " + event_id)
+        assert replay["speak"] and replay["result"]["output"] == "The complete result"
+        assert replay["operation_id"] == presentation["operation_id"]
+        assert replay["attempt_id"] != first_attempt and replay["run_id"] == 1
+        await started(h2, "replayed")
+        await h2.controller.handle(rt.OutputAudio(bytes(960), "replayed-item", "replayed"))
+        await finished(h2, "replayed")
+        state = await h2.controller.refresh(announce=False)
+        assert not state["jobs"][0]["presentation"]["playback_finished"]
+        h2.controller.audio._output_callback(bytearray(960), 480, None, None)
+        await h2.controller.tick()
+        state = await h2.controller.refresh(announce=False)
+        assert state["jobs"][0]["presentation"]["playback_finished"]
+        assert len(host.jobs) == 1
+        with pytest.raises(NativeTaskError, match="409"):
+            await h.controller.command("/replay " + event_id)
+        await close(h)
+        await close(h2)
+
+    asyncio.run(scenario())
+
+
 def test_http_response_cannot_cross_client_generation_switch():
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
