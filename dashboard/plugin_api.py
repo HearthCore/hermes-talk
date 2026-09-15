@@ -69,6 +69,7 @@ import talk_recipients  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_target_selection  # noqa: E402
+import talk_text_input  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
 from talk_dashboard_gateway import DashboardTaskError  # noqa: E402
@@ -464,6 +465,7 @@ async def talk_status(request: Request) -> dict:
                            config.auth_mode == "subscription" else talk_live_config.API_VOICES),
             "version": talk_tools.plugin_version(),
             "taskContinuity": talk_dashboard_tasks.context_support(),
+            "textInput": talk_text_input.descriptor(),
             "agentLoop": "canonical_task",
         }
     status = talk_auth.auth_status()
@@ -478,6 +480,7 @@ async def talk_status(request: Request) -> dict:
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
         "taskContinuity": talk_dashboard_tasks.context_support(),
+        "textInput": talk_text_input.descriptor(),
         # Tri-state, not a bool: no plugin context is ever bound in the web
         # server process, so the only question that matters here is whether the
         # api_server lane can reach a real agent. This route is the page's
@@ -1154,6 +1157,12 @@ RECIPIENT_ROUTE_HANDLERS = talk_recipients.mount_recipient_routes(
     task_call=_task_call, service=TASKS.recipients,
 )
 
+TEXT_INPUT_ROUTE_HANDLERS = talk_text_input.mount_text_input_routes(
+    router, require_auth=require_dashboard_auth, read_body=_json_body,
+    task_call=_task_call, tasks=TASKS, coordinator=LIVE_SESSIONS.coordinator,
+    http_exception=HTTPException,
+)
+
 
 ROUTE_HANDLERS = (
     talk_status,
@@ -1173,6 +1182,7 @@ ROUTE_HANDLERS = (
     task_switch,
     *LIVE_ROUTE_HANDLERS,
     *RECIPIENT_ROUTE_HANDLERS,
+    *TEXT_INPUT_ROUTE_HANDLERS,
 )
 
 

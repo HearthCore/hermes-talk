@@ -361,13 +361,14 @@ class DashboardStages:
         self._save(db, record)
         return record, True
 
-    def live_action(self, token, interaction_id):
+    def live_action(self, token, interaction_id, *, call_id=None):
+        call_id = call_id or "hermes-action-" + interaction_id
         with self._db(token, write=False) as db:
             self._load(db, token, interaction_id)
             row = db.execute(
                 "SELECT record FROM dashboard_actions WHERE owner=? AND interaction_id=? "
                 "AND call_id=?",
-                (self.owner.key, interaction_id, "hermes-action-" + interaction_id),
+                (self.owner.key, interaction_id, call_id),
             ).fetchone()
             return json.loads(row[0]) if row else None
 

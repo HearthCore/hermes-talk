@@ -1051,7 +1051,7 @@ class DashboardTasks:
                     job["approval"] = {
                         "state": "current",
                         "approvals": approvals["approvals"],
-                        "actionable": False,
+                        "actionable": bool(approvals["approvals"]),
                     }
                 except DashboardTaskError as exc:
                     job["approval"] = {

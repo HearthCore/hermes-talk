@@ -51,6 +51,13 @@ RECIPIENT_ERRORS = {
     "recipient_backend_unavailable": "The selected host has no verified recipient bridge.",
     "recipient_response_invalid": "The selected host returned an invalid recipient receipt.",
     "recipient_host_mismatch": "That recipient belongs to a different execution host.",
+    "recipient_selection_mismatch": (
+        "The addressed recipient is not the currently selected recipient. "
+        "Select it again before sending."
+    ),
+    "recipient_control_unavailable": (
+        "The selected recipient is read-only or has no verified send control."
+    ),
 }
 
 
