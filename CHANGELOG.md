@@ -11,6 +11,22 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.19.2] — 2026-09-15
+
+### Fixed
+- GPT-Live subscription mode works again on a stock Hermes install signed in
+  with `hermes auth login openai-codex`. The borrowed Hermes login carried no
+  account id, so `validate_live_auth` refused it and only users who had also
+  run `codex login` could connect. The account is read from the token's
+  `https://api.openai.com/auth` → `chatgpt_account_id` claim, the same claim
+  Hermes uses for its own `ChatGPT-Account-Id` header, and `expires_at` now
+  reports the token's `exp`. The Codex CLI store path reads the same claim
+  when `auth.json` has no `account_id`. Fail-closed behavior is unchanged: a
+  token naming no account still cannot open subscription mode, and nothing
+  falls through to API billing. Reported in #149, fixed in #150.
+- `dashboard/manifest.json` is bumped in step with `pyproject.toml` and
+  `plugin.yaml`; 0.19.1's tag tree missed it.
+
 ## [0.19.1] — 2026-09-15
 
 ### Changed
