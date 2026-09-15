@@ -200,7 +200,10 @@ function TalkHudPresentation(props) {
     ['queued', 'pending', 'accepted', 'running', 'waiting_approval', 'waiting_for_approval',
       'approval_required', 'paused'].includes(job.status)).length;
   const state = starting ? 'Connecting…' : sleeping ? 'Sleeping · microphone off'
-    : muted && active ? 'Microphone muted' : active ? 'Connected · microphone on' : 'Microphone off';
+    : active && props.audioActivity?.output ? 'Audio playing'
+    : muted && active ? 'Microphone muted'
+    : active && props.audioActivity?.input ? 'Microphone audio detected'
+    : active ? 'Connected · microphone on' : 'Microphone off';
   const status = state + ' · Addressed: ' + addressed + ' · Active work: ' + activeWork;
   const collapse = () => { setExpanded(false); toggleRef.current?.focus(); };
   return h('section', { className: 'ht-hud', 'aria-label': 'Hermes Talk floating control',

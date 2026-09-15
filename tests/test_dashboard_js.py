@@ -1692,7 +1692,7 @@ def test_synthetic_summary_isolated_from_inputs_tools_and_ordinary_response_link
   assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
   assert.equal(sent.filter(r=>r.type==='conversation.item.create').length,0);
   assert(errors.some(e=>e.includes('cannot call tools')));
-  assert(requests.some(r=>r.url.endsWith('/speech/receipt') && r.body.state==='sent'));
+  assert(requests.some(r=>r.url.endsWith('/speech/receipt') && r.body.state==='context_submitted'));
   assert(!requests.some(r=>r.body && r.body.state==='playback_acknowledged'));
   // A genuine input still has its own request and canonical settlement.
   await t.task.typed('Continue the discussion');
