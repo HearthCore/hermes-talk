@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 
 import pytest
 from test_dashboard_api import api
@@ -220,6 +221,124 @@ def test_feed_refuses_a_line_that_is_neither_delta_nor_done():
         await asyncio.wait_for(task, 2)
 
     _run(scenario())
+
+
+# -- routing ------------------------------------------------------------------
+#
+# Everything above calls the handler directly, which cannot catch a route that
+# FastAPI never manages to build: an unannotated handler parameter is read as a
+# REQUIRED QUERY PARAMETER, so the socket is refused during dependency
+# resolution (a bare 403 on the upgrade) while every direct call still passes.
+# These tests mount the router exactly as the dashboard does.
+
+
+@pytest.fixture
+def mounted_server():
+    """The plugin router under the core's own prefix, served over a real socket.
+
+    TestClient is not enough here: it runs each request in its own portal, so
+    the socket and the feed land on DIFFERENT event loops — ``put_nowait`` on
+    one cannot wake the waiter on the other, and the relay looks stalled when
+    it is merely unobserved. A real uvicorn server (one loop, one process, as
+    in production) is what proves the two routes actually meet.
+    """
+
+    import threading
+
+    import uvicorn
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    app.include_router(api.router, prefix="/api/plugins/hermes-talk")
+
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+
+    deadline = time.monotonic() + 10
+    while not server.started and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert server.started, "the test server never came up"
+
+    port = server.servers[0].sockets[0].getsockname()[1]
+    yield port
+
+    server.should_exit = True
+    thread.join(timeout=5)
+
+
+def test_the_socket_route_survives_being_mounted(mounted_server, tts):
+    """The upgrade is accepted through the router, not just by the handler.
+
+    The desktop lane dials this path for real; a handler that only works when
+    it is called as a plain coroutine is a lane that silently answers nothing.
+    """
+
+    import json
+
+    import httpx
+    import websockets
+
+    pcm = b"\x05\x06" * 240
+    port = mounted_server
+
+    async def scenario():
+        url = f"ws://127.0.0.1:{port}/api/plugins/hermes-talk/cascade-tts?stream=routed"
+
+        async with websockets.connect(url) as socket:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"http://127.0.0.1:{port}/api/plugins/hermes-talk/cascade-feed",
+                    json={
+                        "stream": "routed",
+                        "delta": "Routed sentence. ",
+                        "done": "Routed sentence.",
+                    },
+                )
+            assert response.status_code == 200
+
+            # The fake cascade's socket needs its audio pushed in; the relay
+            # only emits once the endpoint has something to emit.
+            for _ in range(300):
+                if tts.sockets and len(tts.sockets[0].sent) >= 3:
+                    break
+                await asyncio.sleep(0.01)
+            assert tts.sockets, "the relay never built a cascade voice"
+            tts.sockets[0].feed_audio(pcm)
+            tts.sockets[0].feed_final()
+
+            frames_seen = []
+            while True:
+                frame = json.loads(await asyncio.wait_for(socket.recv(), 10))
+                frames_seen.append(frame)
+                if frame.get("end"):
+                    break
+
+        return frames_seen
+
+    frames_seen = asyncio.run(scenario())
+
+    assert frames_seen[-1] == {"end": True}
+    assert b"".join(base64.b64decode(f["pcm"]) for f in frames_seen if "pcm" in f) == pcm
+
+
+def test_the_socket_route_refuses_a_dial_without_a_stream_id(mounted_server):
+    """A mounted route still enforces its own contract before accepting.
+
+    A refusal that happens before ``accept`` reaches the client as a 403 on
+    the upgrade, not as a close frame — that is what the desktop plugin sees
+    when it dials without a stream id, so it needs to be the asserted shape.
+    """
+
+    from websockets.exceptions import InvalidStatus
+    from websockets.sync.client import connect
+
+    url = f"ws://127.0.0.1:{mounted_server}/api/plugins/hermes-talk/cascade-tts"
+
+    with pytest.raises(InvalidStatus) as excinfo, connect(url):
+        pass
+
+    assert excinfo.value.response.status_code == 403
 
 
 # -- the relay ----------------------------------------------------------------

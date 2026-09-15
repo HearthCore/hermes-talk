@@ -104,7 +104,7 @@ except ImportError:  # pragma: no cover - no dashboard deps at all
 
 
 try:
-    from fastapi import APIRouter, HTTPException, Request
+    from fastapi import APIRouter, HTTPException, Request, WebSocket
 except ImportError:  # pragma: no cover - offline tests run without the dashboard deps
 
     class APIRouter:  # type: ignore[no-redef]
@@ -129,6 +129,9 @@ except ImportError:  # pragma: no cover - offline tests run without the dashboar
 
     class Request:  # type: ignore[no-redef]
         """Annotation target only — never instantiated on this path."""
+
+    class WebSocket:  # type: ignore[no-redef]
+        """Annotation target only — the real one arrives through the router."""
 
 
 class RelayResponse(StreamingResponse):
@@ -943,7 +946,7 @@ async def _cascade_socket_lines(queue: asyncio.Queue) -> AsyncIterator[dict | No
 
 
 @router.websocket("/cascade-tts")
-async def cascade_tts_socket(websocket) -> None:
+async def cascade_tts_socket(websocket: WebSocket) -> None:
     """PCM24k out for whichever response the plugin feeds to its stream id.
 
     One socket spans a session: each response's text arrives on
