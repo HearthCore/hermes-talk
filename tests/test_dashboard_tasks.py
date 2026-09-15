@@ -1137,3 +1137,32 @@ def test_busy_readiness_cannot_claim_and_stale_readiness_cannot_send(environment
     manager.speech_receipt(request, {**context, "event_id": event_id,
                                      "attempt_id": prepared["attempt_id"], "state": "deferred"})
     assert bound.events.speech_candidates(bound.token)
+
+
+def test_first_completed_observation_is_ready_without_transcript_linking(environment, monkeypatch):
+    manager, request, host, _ = environment
+    bound, context = join(environment)
+    action = child(environment, context, input_event(environment, context))["action"]
+    host.jobs[next(iter(host.jobs))].update(
+        status="completed", output="Result before the next poll", updated_at=200.0,
+        last_event="run.completed",
+    )
+    waiting, release = threading.Event(), threading.Event()
+
+    def pending_transcript(*args):
+        waiting.set()
+        release.wait(5)
+        raise AssertionError("Result eligibility waited on transcript linking")
+
+    monkeypatch.setattr(manager, "_link_origin", pending_transcript)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(manager.state, request, context)
+        try:
+            state = future.result(timeout=1)
+        finally:
+            release.set()
+    assert not waiting.is_set()
+    assert state["jobs"][0]["result_available"]
+    assert state["jobs"][0]["presentation"]["state"] == "result_ready"
+    assert state["announcements"][0]["run_id"] == action["run_id"]
+    assert bound.events.speech_candidates(bound.token)
