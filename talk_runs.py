@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Async-run registry — voice never blocks.
 
 Anything slower than a couple of seconds starts here, returns a spoken

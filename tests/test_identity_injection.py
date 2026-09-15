@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Identity injection — what a voice session already knows before you speak.
 
 Fully hermetic: the Hermes modules this reads through (``agent.prompt_builder``

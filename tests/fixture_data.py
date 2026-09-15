@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Load adversarial test payloads from ``tests/fixtures/``.
 
 The strings these helpers return are attack-shaped bytes — injection text,

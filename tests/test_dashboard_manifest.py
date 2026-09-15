@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Dashboard manifest — the host reads this, so a typo is a silent dead tab.
 
 ``_discover_dashboard_plugins`` swallows a bad manifest with a log warning and

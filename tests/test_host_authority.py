@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Host-path speaker authority — the HostExecutionRelay must consult the
 authorization ledger before minting canonical host permits."""
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Readiness observations suppress speech; they never grant task execution authority."""
 
 import pytest

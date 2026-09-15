@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Ephemeral native provider correlation over the canonical Talk task coordinator."""
 
 from __future__ import annotations

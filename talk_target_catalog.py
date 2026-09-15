@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Authorized local profiles/Bot Chats and explicitly registered Hermes peer routes."""
 
 from __future__ import annotations

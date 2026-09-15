@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Provider-neutral Realtime contract tests.  Offline by construction."""
 
 from __future__ import annotations

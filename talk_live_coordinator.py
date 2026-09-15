@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Client delegation into Hermes task ownership, using captured input as evidence."""
 
 from __future__ import annotations

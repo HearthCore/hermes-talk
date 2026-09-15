@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Owner-fenced recipient selection and durable delivery attempts."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Browser batching and asynchronous decision regressions over the real SQLite coordinator."""
 
 import asyncio

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Deterministic attachment/poll ordering over the real native task routes."""
 
 from __future__ import annotations

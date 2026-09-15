@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Authenticated browser and native Live routes over one task coordinator."""
 
 from __future__ import annotations

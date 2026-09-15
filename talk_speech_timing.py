@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Connection-fenced, content-free readiness observations for spoken task updates."""
 
 from __future__ import annotations

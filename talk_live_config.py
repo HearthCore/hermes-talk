@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """GPT-Live configuration and explicit subscription/API credential selection."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Run registry — lifecycle, eviction, and the durable history tail.
 
 Ported from the proven Talk Mode suite. Workers here are plain callables —

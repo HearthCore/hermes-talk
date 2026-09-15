@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """The room issuer and the selected task gateway retain independent ownership."""
 
 from dataclasses import replace

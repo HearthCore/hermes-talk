@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Fake HTTP/WebSocket peers for the two Live negotiation protocols."""
 
 from __future__ import annotations

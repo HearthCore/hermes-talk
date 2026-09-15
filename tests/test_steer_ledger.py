@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """The steer receipt ledger and the drain watchers.
 
 What is being proved: every state transition rides a REAL artifact — the

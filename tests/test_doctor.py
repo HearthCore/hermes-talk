@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Native ``hermes talk doctor`` diagnostics and their read-only contract."""
 
 from __future__ import annotations

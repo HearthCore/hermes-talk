@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Interactive, confirmation-gated setup for ``hermes talk``.
 
 The wizard is deliberately separate from :mod:`talk_doctor`: doctor only

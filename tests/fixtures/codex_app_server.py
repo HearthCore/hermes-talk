@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Scripted app-server wire peer. Executes no models, tools, commands, or file changes."""
 
 import json

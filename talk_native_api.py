@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Native client for authenticated shared Talk task routes; no local permission inference."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """Derived Codex mappings under immutable, host-authorized Hermes job ownership."""
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """hermes-talk's realtime providers, published on the Hermes core contract.
 
 Hermes core defines a provider-neutral speech-to-speech contract in

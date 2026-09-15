@@ -1,3 +1,5 @@
+# Copyright (c) 2026 SmokeDev
+# SPDX-License-Identifier: MIT
 """OpenAI TTS and transcription providers for Hermes's pluggable backends.
 
 Bonus surface, not the point of this plugin: hermes-talk already resolves an
