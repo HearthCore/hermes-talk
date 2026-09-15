@@ -23,17 +23,13 @@ never log it.
 from __future__ import annotations
 
 import base64
-import contextlib
 import json
 import os
-import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-
-import httpx
 
 REALTIME_AUTH_REQUIRED_MESSAGE = (
     "Realtime voice needs a credential: set TALK_OPENAI_API_KEY or "
@@ -41,12 +37,9 @@ REALTIME_AUTH_REQUIRED_MESSAGE = (
     "subscription"
 )
 
-_CODEX_TOKEN_URL = "https://auth.openai.com/oauth/token"
 # Public client id of the official Codex CLI (same id OpenClaw/Codex use).
-_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 _CODEX_FALLBACK_EXPIRY_S = 60 * 60
 _REFRESH_MARGIN_S = 60
-_TOKEN_REQUEST_TIMEOUT_S = 30.0
 
 SOURCE_CONFIGURED = "configured"
 SOURCE_ENV = "env"
@@ -220,118 +213,40 @@ def _fallback_expiry_s(auth_path: Path) -> int:
     return int(base) + _CODEX_FALLBACK_EXPIRY_S
 
 
-def _post_token_form(fields: dict[str, str]) -> dict:
-    """POST a form to the OpenAI OAuth token endpoint. Isolated for tests."""
+def _resolve_hermes_codex_oauth() -> TalkAuth | None:
+    """Borrow the Codex login Hermes itself holds (``hermes auth login openai-codex``).
 
-    response = httpx.post(
-        _CODEX_TOKEN_URL,
-        data=fields,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=_TOKEN_REQUEST_TIMEOUT_S,
+    Hermes owns that token store and refreshes it under a cross-process lock, so this is
+    the one place a refresh may happen. Returns None when Hermes is not importable (the
+    plugin running standalone) or has no Codex login.
+    """
+    try:
+        from hermes_cli.auth_codex import resolve_codex_runtime_credentials
+    except ImportError:
+        return None
+    try:
+        creds = resolve_codex_runtime_credentials()
+    except Exception:  # noqa: BLE001 — any Hermes auth error just means "no usable login here"
+        return None
+    token = creds.get("api_key") if isinstance(creds, dict) else None
+    if not isinstance(token, str) or not token:
+        return None
+    return TalkAuth(
+        token=token,
+        source=SOURCE_CODEX_OAUTH,
+        detail="Hermes Codex login (ChatGPT subscription)",
+        expires_at=None,
+        account_id=None,
     )
-    if response.status_code != 200:
-        raise TalkAuthError(
-            f"Codex token refresh failed ({response.status_code}): "
-            f"{response.text[:300] or response.reason_phrase}"
-        )
-    try:
-        payload = response.json()
-    except Exception as exc:
-        raise TalkAuthError("Codex token refresh returned non-JSON response") from exc
-    if not isinstance(payload, dict):
-        raise TalkAuthError("Codex token refresh returned invalid response")
-    return payload
-
-
-def _write_auth_json(auth_path: Path, data: dict) -> None:
-    """Atomically persist refreshed tokens, preserving the file's shape."""
-
-    fd, tmp_name = tempfile.mkstemp(prefix="auth-", suffix=".json", dir=str(auth_path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-            handle.write("\n")
-        os.replace(tmp_name, auth_path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
-
-
-def _refresh_codex_credential(
-    auth_path: Path, data: dict, credential: _CodexOauthCredential
-) -> _CodexOauthCredential:
-    try:
-        payload = _post_token_form(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": credential.refresh,
-                "client_id": _CODEX_CLIENT_ID,
-            }
-        )
-    except TalkAuthError as exc:
-        # Refresh-token race: the Codex CLI may have refreshed concurrently,
-        # consuming the single-use refresh token we just tried. Re-read the
-        # file once — if it now holds a different, valid access token, use it.
-        reread = _read_codex_auth_json(auth_path)
-        if reread is not None:
-            reparsed = _parse_codex_oauth_credential(reread, _fallback_expiry_s(auth_path))
-            if (
-                reparsed is not None
-                and reparsed.access != credential.access
-                and reparsed.expires_s > time.time() + _REFRESH_MARGIN_S
-            ):
-                return reparsed
-        raise TalkAuthError(
-            f"{REALTIME_AUTH_REQUIRED_MESSAGE}. Codex token refresh failed — "
-            f"run `codex login` to refresh your ChatGPT sign-in. Detail: {exc}"
-        ) from exc
-
-    access = payload.get("access_token")
-    refresh = payload.get("refresh_token")
-    expires_in = payload.get("expires_in")
-    if (
-        not isinstance(access, str)
-        or not access
-        or not isinstance(refresh, str)
-        or not refresh
-        or not isinstance(expires_in, (int, float))
-    ):
-        raise TalkAuthError(
-            "Codex token refresh response missing fields "
-            "(access_token, refresh_token, expires_in)"
-        )
-
-    expires_s = int(time.time()) + int(expires_in)
-    refreshed = _CodexOauthCredential(
-        access=access,
-        refresh=refresh,
-        expires_s=expires_s,
-        account_id=credential.account_id,
-        id_token=(
-            payload.get("id_token")
-            if isinstance(payload.get("id_token"), str)
-            else credential.id_token
-        ),
-    )
-
-    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
-    data["tokens"] = {
-        **tokens,
-        "access_token": refreshed.access,
-        "refresh_token": refreshed.refresh,
-        **({"id_token": refreshed.id_token} if refreshed.id_token else {}),
-        **({"account_id": refreshed.account_id} if refreshed.account_id else {}),
-    }
-    data["last_refresh"] = datetime.now(UTC).isoformat()
-    # Persisting is best-effort: the in-memory token is still valid for this
-    # session even if the write-back fails (read-only profile dir).
-    with contextlib.suppress(OSError):
-        _write_auth_json(auth_path, data)
-    return refreshed
 
 
 def _resolve_codex_oauth(codex_home: Path | None = None) -> TalkAuth | None:
+    hermes_auth = _resolve_hermes_codex_oauth()
+    if hermes_auth is not None:
+        return hermes_auth
+    # Fallback: the Codex CLI's own store, READ-ONLY. Talk never refreshes or rewrites
+    # ``~/.codex/auth.json`` — that file belongs to the Codex CLI. An expired token is
+    # reported so the user re-logins with the vendor CLI (or logs Hermes in).
     auth_path = _codex_auth_path(codex_home)
     data = _read_codex_auth_json(auth_path)
     if data is None:
@@ -340,7 +255,10 @@ def _resolve_codex_oauth(codex_home: Path | None = None) -> TalkAuth | None:
     if credential is None:
         return None
     if credential.expires_s <= time.time() + _REFRESH_MARGIN_S:
-        credential = _refresh_codex_credential(auth_path, data, credential)
+        raise TalkAuthError(
+            "Codex OAuth token is expired. Run `codex login` (or `hermes auth login "
+            "openai-codex`) and retry; Talk does not refresh vendor credential files."
+        )
     return TalkAuth(
         token=credential.access,
         source=SOURCE_CODEX_OAUTH,
