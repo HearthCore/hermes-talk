@@ -132,6 +132,9 @@ function createTalkSurface(SDK) {
       const now = this.clock(), previous = this.samples[kind];
       this.samples[kind] = { at: now, active: active,
         voicedAt: active ? now : previous ? previous.voicedAt : -Infinity };
+      if ((!previous || previous.active !== active) && this.task.transport.cb.onAudioActivity) {
+        this.task.transport.cb.onAudioActivity(kind, active);
+      }
     }
 
     quiet(kind) {
@@ -228,12 +231,28 @@ function createTalkSurface(SDK) {
       this.preparing = false;
       this.responses = new Set();
       this.cancelled = new Set();
+      this.submitted = new Set();
+      this.epoch = 0;
     }
 
     offer(state) {
       this.task.timing.recover();
-      this.pending = (state.announcements || []).slice(0, 8);
+      const replay = this.pending.filter((item) => item.replay);
+      this.pending = replay.concat((state.announcements || []).filter((item) =>
+        !this.submitted.has(item.event_id) && !replay.some((queued) => queued.event_id === item.event_id)))
+        .slice(0, 8);
       void this.drain();
+    }
+
+    async replay(eventId) {
+      if (this.task.closed || this.task.transport.closed || typeof eventId !== "string" || !eventId ||
+          this.task.transport.live || this.pending.length >= 8 ||
+          (this.active && this.active.event_id === eventId) ||
+          this.pending.some((item) => item.event_id === eventId && item.replay)) return false;
+      this.pending = [{ event_id: eventId, replay: true }].concat(
+        this.pending.filter((item) => item.event_id !== eventId));
+      await this.drain();
+      return !this.task.closed;
     }
 
     idle() {
@@ -247,12 +266,22 @@ function createTalkSurface(SDK) {
       if (this.preparing || this.active || !this.pending.length || !this.idle()) return;
       this.preparing = true;
       let prepared = null;
+      const epoch = this.epoch;
       try {
         const next = this.pending.shift();
-        prepared = await this.task.request("/speech", { event_id: next.event_id,
-          timing: this.task.timing.snapshot() });
-        if (!prepared.speak || this.task.closed) return;
-        if (!this.idle()) {
+        const transport = this.task.transport;
+        const playbackSupported = Boolean(transport.cascade && (transport.pcmContext ||
+          window.AudioContext || window.webkitAudioContext));
+        const reply = await this.task.request("/speech", { event_id: next.event_id,
+          timing: this.task.timing.snapshot(), presentation_protocol: 1,
+          playback_supported: playbackSupported, ...(next.replay ? { replay: true } : {}) });
+        if (!reply.speak || this.task.closed) return;
+        if (reply.event_id !== next.event_id || typeof reply.attempt_id !== "string" || !reply.attempt_id) {
+          throw new Error("Task presentation did not identify the requested event.");
+        }
+        prepared = Object.assign({}, reply, { playback_supported: playbackSupported,
+          last_at: this.task.timing.clock(), pcm_pending: 0 });
+        if (epoch !== this.epoch || !this.idle()) {
           await this.receipt(prepared, "deferred");
           this.pending.unshift(next);
           return;
@@ -265,28 +294,76 @@ function createTalkSurface(SDK) {
           await this.receipt(prepared, "unknown");
           throw new Error("Invalid isolated task presentation.");
         }
-        const transport = this.task.transport;
-        prepared.last_at = this.task.timing.clock();
         this.active = prepared;
         if (prepared.result && transport.cb.onTaskResult) transport.cb.onTaskResult(prepared.result);
-        if (!transport.send({ type: "response.create", event_id: prepared.attempt_id,
-          response: Object.assign({}, response, { output_modalities: [transport.cascade ? "text" : "audio"] }) })) {
-          this.active = null;
-          await this.receipt(prepared, "deferred");
-          this.pending.unshift(next);
+        await this.receipt(prepared, "submitting");
+        if (this.active !== prepared || epoch !== this.epoch || this.task.closed || !this.idle()) {
+          if (this.active === prepared) {
+            this.active = null;
+            await this.receipt(prepared, "deferred");
+            this.pending.unshift(next);
+          }
           return;
         }
-        await this.receipt(prepared, "sent");
+        prepared.dispatching = true;
+        this.submitted.add(prepared.event_id);
+        if (this.submitted.size > 128) this.submitted.delete(this.submitted.values().next().value);
+        if (!transport.send({ type: "response.create", event_id: prepared.attempt_id,
+          response: Object.assign({}, response, { output_modalities: [transport.cascade ? "text" : "audio"] }) })) {
+          this.finish(prepared, "unknown");
+          return;
+        }
+        await this.receipt(prepared, "context_submitted");
       } catch (err) {
+        if (prepared && this.active === prepared) this.finish(prepared, prepared.dispatching ? "unknown" : "deferred");
         this.task.report(errorText(err));
       } finally { this.preparing = false; }
     }
 
     receipt(prepared, state) {
       const prior = prepared.receiptTail || Promise.resolve();
-      prepared.receiptTail = prior.then(() => this.task.request("/speech/receipt", {
-        event_id: prepared.event_id, attempt_id: prepared.attempt_id, state: state }));
+      const terminal = ["interrupted", "unknown", "deferred", "playback_finished"].includes(state);
+      prepared.receiptTail = (terminal ? prior.catch(() => {}) : prior).then(async () => {
+        const body = { event_id: prepared.event_id, attempt_id: prepared.attempt_id, state: state,
+          ...(prepared.response_id ? { response_id: prepared.response_id } : {}) };
+        // Retirement must survive local teardown, which immediately aborts task reads.
+        const reply = terminal ? await apiCall("/speech/receipt", { method: "POST", keepalive: true,
+          body: JSON.stringify(Object.assign(body, this.task.context)) })
+          : await this.task.request("/speech/receipt", body);
+        if (!reply || reply.ok !== true) throw new Error("Task presentation receipt was not accepted.");
+        return reply;
+      });
       return prepared.receiptTail;
+    }
+
+    finish(current, state) {
+      if (this.active !== current) return;
+      this.active = null;
+      void this.receipt(current, state).catch((err) => this.task.report(errorText(err)))
+        .finally(() => { void this.task.refresh(); });
+    }
+
+    playback(responseId, observation) {
+      const current = this.active;
+      if (!current || !current.playback_supported || current.response_id !== responseId || this.task.closed) return;
+      current.last_at = this.task.timing.clock();
+      if (observation === "scheduled") current.pcm_pending += 1;
+      if (observation === "started" && !current.playback_started) {
+        current.playback_started = true;
+        void this.receipt(current, "playback_started").catch((err) => {
+          this.task.report(errorText(err)); this.finish(current, "unknown");
+        });
+      }
+      if (observation === "drained") current.pcm_pending = Math.max(0, current.pcm_pending - 1);
+      if (observation === "stream_done") current.stream_done = true;
+      if (observation === "failed") { this.finish(current, "unknown"); return; }
+      this.completePlayback(current);
+    }
+
+    completePlayback(current) {
+      if (current.generation_done && current.stream_done && !current.pcm_pending) {
+        this.finish(current, current.playback_started ? "playback_finished" : "unknown");
+      }
     }
 
     handle(event) {
@@ -312,7 +389,13 @@ function createTalkSurface(SDK) {
           current.last_at = this.task.timing.clock();
           this.responses.add(response.id);
           if (this.responses.size > 64) this.responses.delete(this.responses.values().next().value);
-        } else this.task.report("Unlinked task summary refused.");
+        } else {
+          this.task.report("Unlinked task summary refused.");
+          if (response.id) {
+            this.responses.add(response.id);
+            this.task.transport.send({ type: "response.cancel", response_id: response.id });
+          }
+        }
         return true;
       }
       const id = event.response_id || response.id;
@@ -327,36 +410,38 @@ function createTalkSurface(SDK) {
       }
       if (["response.output_text.delta", "response.output_audio_transcript.delta"].includes(event.type)) {
         if (event.delta) transport.cb.onTranscript("assistant", event.delta, false);
-        if (transport.cascade && event.delta) transport.cascadeSend({ delta: event.delta });
+        if (transport.cascade && event.delta && !current.text_done) transport.cascadeSend({ delta: event.delta }, id);
       }
       if (["response.output_text.done", "response.output_audio_transcript.done"].includes(event.type)) {
         const text = event.text || event.transcript || "";
         if (text) transport.cb.onTranscript("assistant", text, true);
-        if (transport.cascade) {
-          transport.cascadeSend({ done: text });
+        if (transport.cascade && !current.text_done) {
+          current.text_done = true;
+          transport.cascadeSend({ done: text }, id);
           transport.finishCascadeStream();
         }
       }
       if (event.type === "response.done") {
-        this.active = null;
+        current.generation_done = true;
         if (response.status !== "completed") {
+          this.finish(current, current.playback_started ? "interrupted" : "unknown");
           transport.clearPlayback();
-          void this.receipt(current, "unknown").catch((err) => this.task.report(errorText(err)));
-        }
+        } else if (!current.playback_supported || !current.text_done) this.finish(current, "unknown");
+        else this.completePlayback(current);
         void this.task.refresh();
       }
       return true;
     }
 
     interrupt() {
+      this.epoch += 1;
       if (!this.active) return;
       const current = this.active;
       this.cancelled.add(current.attempt_id);
       if (this.cancelled.size > 64) this.cancelled.delete(this.cancelled.values().next().value);
+      this.finish(current, !current.dispatching ? "deferred" : current.playback_started ? "interrupted" : "unknown");
       this.task.transport.clearPlayback();
       if (current.response_id) this.task.transport.send({ type: "response.cancel", response_id: current.response_id });
-      void this.receipt(current, "unknown").catch((err) => this.task.report(errorText(err)));
-      this.active = null;
     }
   }
 
@@ -1160,8 +1245,9 @@ function createTalkSurface(SDK) {
      * streams back — the first sentence plays while the model is still
      * writing the second, same as the terminal lane's sentence pipelining.
      */
-    startCascadeStream() {
-      const req = { controller: new AbortController(), sink: null, buffered: null };
+    startCascadeStream(responseId) {
+      const req = { controller: new AbortController(), sink: null, buffered: null,
+        response_id: responseId, pcm_generation: this.pcmGeneration };
       this.cascadeReq = req;
       this.cascadeReqs.add(req);
       if (!canStreamUpload()) {
@@ -1199,6 +1285,9 @@ function createTalkSurface(SDK) {
           if (!res.ok || !res.body) {
             this.noteCascadeFailure("relay refused the answer (" +
               ((res && res.status) || "no response") + ")");
+            if (this.task) this.task.presentation.playback(req.response_id, "failed");
+            this.cascadeReqs.delete(req);
+            if (this.cascadeReq === req) this.cascadeReq = null;
             return undefined;
           }
           return this.playCascadePcm(req, res.body.getReader());
@@ -1210,7 +1299,10 @@ function createTalkSurface(SDK) {
           // working session with a mute voice.
           if (!req.controller.signal.aborted) {
             this.noteCascadeFailure(errorText(error));
+            if (this.task) this.task.presentation.playback(req.response_id, "failed");
           }
+          this.cascadeReqs.delete(req);
+          if (this.cascadeReq === req) this.cascadeReq = null;
         });
     }
 
@@ -1225,11 +1317,12 @@ function createTalkSurface(SDK) {
       }
     }
 
-    cascadeSend(line) {
+    cascadeSend(line, responseId) {
       // The previous response's relay may still be draining PCM — that is no
       // reason to drop THIS response's text; it opens its own stream.
       const open = this.cascadeReq && (this.cascadeReq.sink || this.cascadeReq.buffered);
-      if (!open) this.startCascadeStream();
+      if (open && this.cascadeReq.response_id !== responseId) this.finishCascadeStream();
+      if (!open || !this.cascadeReq || this.cascadeReq.response_id !== responseId) this.startCascadeStream(responseId);
       const req = this.cascadeReq;
       if (!req) return;
       // An upload stream carries BYTES — a string chunk is a fetch-type error.
@@ -1286,16 +1379,18 @@ function createTalkSurface(SDK) {
     }
 
     stopPcmPlayback() {
-      for (let i = 0; i < this.pcmSources.length; i++) {
+      this.pcmGeneration += 1;
+      const sources = this.pcmSources;
+      this.pcmSources = [];
+      for (const source of sources) {
+        window.clearTimeout(source.talkPlaybackTimer);
         try {
-          this.pcmSources[i].stop();
+          source.stop();
         } catch (e) {
           /* a finished source throws on stop — that is the goal anyway */
         }
       }
-      this.pcmSources = [];
       this.pcmNextTime = 0;
-      this.pcmGeneration += 1;
       // Interpolation state belongs to the answer that was speaking. Left
       // behind, it would splice the end of an interrupted sentence onto the
       // start of the next one — the same seam click, one barge-in later.
@@ -1305,25 +1400,30 @@ function createTalkSurface(SDK) {
 
     /** PCM24k mono s16le off the wire onto the playback timeline. */
     async playCascadePcm(req, reader) {
-      const generation = this.pcmGeneration;
+      const generation = req.pcm_generation;
       let pending = new Uint8Array(0);
+      let complete = false;
       try {
         for (;;) {
           const step = await reader.read();
-          if (step.done || !this.cascadeReqs.has(req)) break;
+          if (!this.cascadeReqs.has(req) || generation !== this.pcmGeneration) break;
+          if (step.done) { complete = pending.length === 0; break; }
           const chunk = step.value;
           const joined = new Uint8Array(pending.length + chunk.length);
           joined.set(pending, 0);
           joined.set(chunk, pending.length);
           const even = joined.length - (joined.length % 2);  // s16le = 2 bytes/sample
           pending = joined.slice(even);
-          if (even > 0) this.schedulePcm(joined.slice(0, even), generation);
+          if (even > 0) this.schedulePcm(joined.slice(0, even), generation, req.response_id);
         }
       } catch (e) {
         // An aborted fetch rejects the reader — the barge-in already spoke.
       }
       this.cascadeReqs.delete(req);
       if (this.cascadeReq === req) this.cascadeReq = null;
+      if (this.task && generation === this.pcmGeneration && !req.controller.signal.aborted) {
+        this.task.presentation.playback(req.response_id, complete ? "stream_done" : "failed");
+      }
     }
 
     /**
@@ -1352,11 +1452,14 @@ function createTalkSurface(SDK) {
     }
 
     /** Schedule one chunk after the last — gapless, in arrival order. */
-    schedulePcm(bytes, generation) {
+    schedulePcm(bytes, generation, responseId) {
       if (generation !== this.pcmGeneration) return;  // decoded before a barge-in
       if (!this.pcmContext) {
         this.pcmContext = makePcmContext();
-        if (!this.pcmContext) return;  // no playback surface — transcript still reads
+        if (!this.pcmContext) {
+          if (this.task) this.task.presentation.playback(responseId, "failed");
+          return;
+        }
         this.pcmNextTime = 0;
       }
       const ctx = this.pcmContext;
@@ -1379,7 +1482,31 @@ function createTalkSurface(SDK) {
       source.start(at);
       this.pcmNextTime = at + buffer.duration;
       this.pcmSources.push(source);
-      if (this.pcmSources.length > 512) this.pcmSources.splice(0, 256);
+      const current = () => !this.closed && generation === this.pcmGeneration;
+      const observe = (state) => {
+        if (current() && this.task) this.task.presentation.playback(responseId, state);
+      };
+      observe("scheduled");
+      const measureStart = () => {
+        const summary = this.task && this.task.presentation.active;
+        if (!current() || !summary || summary.response_id !== responseId) return;
+        if (ctx.state === "running" && ctx.currentTime > at) observe("started");
+        else source.talkPlaybackTimer = window.setTimeout(measureStart, 25);
+      };
+      if (responseId && this.task) source.talkPlaybackTimer = window.setTimeout(measureStart, 25);
+      let ended = false;
+      source.onended = () => {
+        if (ended) return;
+        ended = true;
+        window.clearTimeout(source.talkPlaybackTimer);
+        const index = this.pcmSources.indexOf(source);
+        if (index !== -1) this.pcmSources.splice(index, 1);
+        if (!current()) return;
+        if (ctx.currentTime >= at + buffer.duration) {
+          observe("started");
+          observe("drained");
+        } else observe("failed");
+      };
     }
 
     /**
@@ -1762,6 +1889,20 @@ function createTalkSurface(SDK) {
       ") / " + (target.profile || "unavailable profile");
   }
 
+  function recipientIdentity(row) {
+    if (!row) return null;
+    const identity = {};
+    for (const field of ["recipient_id", "app", "task_id", "host_id"]) {
+      if (typeof row[field] !== "string" || !row[field]) throw new Error("Recipient identity is incomplete.");
+      identity[field] = row[field];
+    }
+    return identity;
+  }
+
+  function sameRecipient(left, right) {
+    return ["recipient_id", "app", "task_id", "host_id"].every(key => left?.[key] === right?.[key]);
+  }
+
   function controlLabel(control) {
     if (!control) return "Control receipt unavailable";
     if (control.status === "queued" && control.source === "host_receipt" &&
@@ -1800,13 +1941,30 @@ function createTalkSurface(SDK) {
     const [taskState, setTaskState] = useState(null);
     const [stages, setStages] = useState({});
     const [results, setResults] = useState({});
-    const [typed, setTyped] = useState("");
+    const [typed, updateTyped] = useState("");
     const [sending, setSending] = useState(false);
     const [switching, setSwitching] = useState(false);
     const [choices, setChoices] = useState([]);
     const [reference, setReference] = useState("");
     const [selection, setSelection] = useState(null);
     const [catalogReload, setCatalogReload] = useState(0);
+    const [attachments, updateAttachments] = useState([]);
+    const [inputError, setInputError] = useState("");
+    const [actionReceipt, setActionReceipt] = useState(null);
+    const [recipients, setRecipients] = useState([]);
+    const [selectedRecipient, updateRecipient] = useState("");
+    const [recipientOperation, updateOperation] = useState("message");
+    const [recipientQuery, setRecipientQuery] = useState("");
+    const [recipientHistory, setRecipientHistory] = useState(null);
+    const [recipientSources, setRecipientSources] = useState([]);
+    const [recipientLoading, setRecipientLoading] = useState(false);
+    const [recipientError, setRecipientError] = useState("");
+    const [selectedJob, setSelectedJob] = useState(null);
+    const [pendingActions, setPendingActions] = useState({});
+    const [muted, updateMuted] = useState(false);
+    const [sleeping, updateSleeping] = useState(false);
+    const [audioActivity, setAudioActivity] = useState({ input: false, output: false });
+    const [appearance, updateAppearance] = useState({ skin: "system", animate: false });
 
     const transportRef = useRef(null);
     const connectionEpoch = useRef(0);
@@ -1820,6 +1978,93 @@ function createTalkSurface(SDK) {
     const rowId = useRef(1);
     const phaseRef = useRef("idle");
     phaseRef.current = phase;
+    const draftRef = useRef({ text: "", files: [], revision: 0 });
+    const sendingRef = useRef(false);
+    const submissionRef = useRef(null);
+    const captureSession = useRef(null);
+    if (!captureSession.current) captureSession.current = clientId("typed_session_");
+    const textSessionRef = useRef(null);
+    const recipientEpoch = useRef(0);
+    const recipientBusy = useRef(false);
+    const confirmedRecipient = useRef(null);
+    const actionLocks = useRef(new Set());
+    const actionRequests = useRef(new Map());
+    const latestTaskState = useRef(taskState);
+    latestTaskState.current = taskState;
+    const audioMode = useRef({ muted: false, sleeping: false });
+    const mounted = useRef(true);
+    const preferenceKey = "hermes-talk-appearance:" + JSON.stringify(SDK.desktopOwner
+      ? [SDK.desktopOwner.connectionId, SDK.desktopOwner.profile,
+        SDK.desktopOwner.sessionId, SDK.desktopOwner.storedSessionId]
+      : [tabId.current, peerId, profile, selectedTask]);
+
+    function setTyped(text) {
+      draftRef.current = { ...draftRef.current, text, revision: draftRef.current.revision + 1 };
+      updateTyped(text);
+    }
+
+    function addAttachments(files) {
+      const added = Array.from(files || []);
+      const current = draftRef.current.files;
+      if (current.length + added.length > 8 || added.some(file =>
+        !file || typeof file.name !== "string" || !Number.isFinite(file.size) || file.size < 0 ||
+        file.size > 10 * 1024 * 1024 || typeof file.slice !== "function") ||
+        [...current, ...added].reduce((total, file) => total + file.size, 0) > 20 * 1024 * 1024) {
+        setInputError("Choose up to 8 files, at most 10 MiB each and 20 MiB together.");
+        return false;
+      }
+      const next = current.concat(added.map(file => ({ id: clientId("file_"), file,
+        name: file.name, type: file.type || "", size: file.size,
+        previewUrl: ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type) &&
+          typeof URL !== "undefined" && URL.createObjectURL ? URL.createObjectURL(file) : undefined })));
+      draftRef.current = { ...draftRef.current, files: next, revision: draftRef.current.revision + 1 };
+      updateAttachments(next);
+      setInputError("");
+      return true;
+    }
+
+    function removeAttachment(id) {
+      const old = draftRef.current.files.find(file => file.id === id);
+      if (old?.previewUrl) URL.revokeObjectURL(old.previewUrl);
+      const next = draftRef.current.files.filter(file => file.id !== id);
+      draftRef.current = { ...draftRef.current, files: next, revision: draftRef.current.revision + 1 };
+      updateAttachments(next);
+    }
+
+    function setAppearance(next) {
+      if (!["system", "quiet", "contrast"].includes(next?.skin) || typeof next.animate !== "boolean") return;
+      updateAppearance({ skin: next.skin, animate: next.animate });
+      try { window.localStorage.setItem(preferenceKey, JSON.stringify(next)); } catch (e) { /* storage unavailable */ }
+    }
+
+    useEffect(() => {
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(preferenceKey));
+        if (["system", "quiet", "contrast"].includes(saved?.skin) && typeof saved.animate === "boolean") {
+          updateAppearance({ skin: saved.skin, animate: saved.animate });
+        }
+      } catch (e) { /* appearance is optional */ }
+    }, [preferenceKey]);
+
+    function applyAudioMode() {
+      const transport = transportRef.current;
+      if (!transport) return;
+      const mode = audioMode.current;
+      transport.media?.getAudioTracks().forEach(track => { track.enabled = !mode.muted && !mode.sleeping; });
+      if (transport.audio) transport.audio.muted = mode.sleeping;
+    }
+
+    function setMuted(value) {
+      audioMode.current.muted = value === true;
+      updateMuted(value === true);
+      applyAudioMode();
+    }
+
+    function setSleeping(value) {
+      audioMode.current.sleeping = value === true;
+      updateSleeping(value === true);
+      applyAudioMode();
+    }
 
     const handleError = useCallback((err) => {
       if (isAuthError(err)) setNeedsToken(true);
@@ -1830,21 +2075,30 @@ function createTalkSurface(SDK) {
       setLoading(true);
       try {
         const res = await apiCall("/status");
+        if (!mounted.current) return;
         setStatus(res);
         setVoice((current) => current || res.voice || "");
         setNeedsToken(false);
         setError("");
       } catch (err) {
+        if (!mounted.current) return;
         setStatus(null);
         handleError(err);
       } finally {
-        setLoading(false);
+        if (mounted.current) setLoading(false);
       }
     }, [handleError]);
 
     const refreshRuns = useCallback(async () => {
       const transport = transportRef.current;
-      if (transport && transport.task) { await transport.task.refresh(); return; }
+      if (transport && transport.task) {
+        await transport.task.refresh();
+        // Pending typed operations settle through this poll whether or not the
+        // transport is text-only: an owner message admitted during a voice
+        // session names an operation on a transport whose textOnly is false.
+        if (transport.typedOperations?.size > 0) await pollTypedOperations(transport);
+        return;
+      }
       try {
         const res = await apiCall("/runs");
         if (transportRef.current === transport) setRuns((res && res.runs) || []);
@@ -1854,9 +2108,12 @@ function createTalkSurface(SDK) {
     }, []);
 
     useEffect(() => {
+      mounted.current = true;
       void refresh();
       const cleanup = () => {
+        mounted.current = false;
         connectionEpoch.current++;
+        recipientEpoch.current++;
         if (sessionAbort.current) sessionAbort.current.abort();
         sessionAbort.current = null;
         switchEpoch.current++;
@@ -1864,11 +2121,15 @@ function createTalkSurface(SDK) {
         switchAbort.current = null;
         if (transportRef.current) transportRef.current.stop();
         transportRef.current = null;
+        for (const file of draftRef.current.files) if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
       };
       window.addEventListener("pagehide", cleanup);
+      SDK.lifetimeSignal?.addEventListener("abort", cleanup, { once: true });
+      if (SDK.lifetimeSignal?.aborted) cleanup();
       return () => {
         cleanup();
         window.removeEventListener("pagehide", cleanup);
+        SDK.lifetimeSignal?.removeEventListener("abort", cleanup);
       };
     }, [refresh]);
 
@@ -1931,7 +2192,7 @@ function createTalkSurface(SDK) {
         if (cancelled) return;
         await refreshRuns();
         if (cancelled) return;
-        timer = window.setTimeout(loop, phaseRef.current === "active" ? RUN_POLL_MS : IDLE_POLL_MS);
+        timer = window.setTimeout(loop, ["active", "text"].includes(phaseRef.current) ? RUN_POLL_MS : IDLE_POLL_MS);
       };
       void loop();
       return () => {
@@ -1945,16 +2206,30 @@ function createTalkSurface(SDK) {
         Object.assign({}, metadata || {}, { role, text, final }), rowId.current++));
     }, []);
 
-    async function installSession(session, epoch) {
+    async function installSession(session, epoch, textOnly = false) {
       const current = () => epoch === connectionEpoch.current;
       const transport = makeTransport(session, {
         onStatus: (message) => { if (current()) setLive(message); },
+        onAudioActivity: (kind, value) => {
+          if (current()) setAudioActivity(previous => ({ ...previous, [kind]: value }));
+        },
         onTranscript: (role, text, final, metadata) => {
           if (current()) appendTranscript(role, text, final, metadata);
         },
         onError: (message) => { if (current()) setError(message); },
         onClosed: () => { if (current()) { setPhase("idle"); setLive(""); setSending(false); } },
-        onTaskState: (state) => { if (current()) setTaskState(state); },
+        onTaskState: (state) => {
+          if (!current()) return;
+          setTaskState(state);
+          const addressed = state.recipients?.selected;
+          if (!recipientBusy.current && addressed && !sameRecipient(addressed, confirmedRecipient.current)) {
+            recipientEpoch.current++;
+            confirmedRecipient.current = recipientIdentity(addressed);
+            updateRecipient(addressed.recipient_id);
+            setRecipients(rows => rows.filter(row => row.recipient_id !== addressed.recipient_id).concat(addressed));
+            setRecipientHistory(null);
+          }
+        },
         onTaskResult: (result) => {
           if (current()) setResults((prev) => Object.assign({}, prev, { [result.run_id]: result }));
         },
@@ -1963,6 +2238,8 @@ function createTalkSurface(SDK) {
           ? switchTarget(intent, source) : Promise.resolve(false),
       });
       transportRef.current = transport;
+      transport.textOnly = textOnly;
+      if (textOnly) transport.typedOperations = new Map();
       lastTask.current = session.task || null;
       setSelection(session.selection || (session.task ? { return_depth: session.task.return_depth || 0 } : null));
       setTaskState(session.task ? { task: session.task, history: session.task.history, interactions: [], jobs: [] } : null);
@@ -1970,20 +2247,27 @@ function createTalkSurface(SDK) {
       setStages({});
       setResults({});
       setRuns([]);
-      setTyped("");
-      setSending(false);
+      setAudioActivity({ input: false, output: false });
+      if (!textOnly) setSending(false);
       setChoices([]);
       if (session.task && session.task.target_id) {
         setSelectedTask(session.task.target_id);
         if (session.task.peer_id) setPeerId(session.task.peer_id);
         if (session.task.profile) setProfile(session.task.profile);
       }
-      await transport.start();
-      if (current() && !transport.closed) setPhase("active");
+      if (textOnly) {
+        setPhase("text");
+        phaseRef.current = "text";
+        await transport.task.refresh();
+      } else {
+        await transport.start();
+        applyAudioMode();
+        if (current() && !transport.closed) setPhase("active");
+      }
     }
 
     async function startTalk() {
-      if (phaseRef.current !== "idle") return;
+      if (!["idle", "text"].includes(phaseRef.current) || textSessionRef.current || sendingRef.current) return;
       setError("");
       if (typeof RTCPeerConnection === "undefined" || !navigator.mediaDevices) {
         setError("Talk needs a browser with WebRTC and microphone access.");
@@ -2001,6 +2285,8 @@ function createTalkSurface(SDK) {
       setResults({});
       setTaskState(null);
       const epoch = ++connectionEpoch.current;
+      if (transportRef.current) transportRef.current.stop();
+      transportRef.current = null;
       const controller = new AbortController();
       sessionAbort.current = controller;
       try {
@@ -2058,6 +2344,9 @@ function createTalkSurface(SDK) {
       phaseRef.current = "idle";
       setLive("");
       setSending(false);
+      sendingRef.current = false;
+      textSessionRef.current = null;
+      if (SDK.stopHost) SDK.stopHost();
     }
 
     function cancelSwitch(showNotice = true) {
@@ -2077,6 +2366,10 @@ function createTalkSurface(SDK) {
     }
 
     async function switchTarget(intent, source) {
+      if (SDK.desktopOwner) {
+        setError("Stop Talk before opening a different voice owner. Addressing another recipient does not change the owner.");
+        return false;
+      }
       const old = transportRef.current;
       if (source && source !== old) return false;
       const owner = old && old.task ? old.task.context : lastTask.current;
@@ -2148,22 +2441,358 @@ function createTalkSurface(SDK) {
       }
     }
 
-    async function sendTyped() {
-      const transport = transportRef.current;
-      if (!transport || !typed.trim() || sending) return;
+    const inputCapabilities = status?.textInput?.version === 1 ? status.textInput : null;
+
+    async function ensureTextBinding() {
+      const existing = transportRef.current;
+      if (existing?.task && !existing.closed) return existing;
+      if (!mounted.current || SDK.lifetimeSignal?.aborted) {
+        throw new Error("The Talk owner is no longer available.");
+      }
+      if (phaseRef.current === "starting" || switchAbort.current) throw new Error("Wait for the current connection.");
+      if (textSessionRef.current) return textSessionRef.current;
       const epoch = connectionEpoch.current;
-      setSending(true);
+      const controller = new AbortController();
+      sessionAbort.current = controller;
+      const pending = (async () => {
+        let targetId = selectedTask;
+        if (SDK.prepareTask) {
+          const target = await SDK.prepareTask({ tabId: tabId.current, signal: controller.signal });
+          if (controller.signal.aborted || epoch !== connectionEpoch.current) throw new Error("Connection cancelled.");
+          targetId = target?.target_id;
+          setSelectedTask(targetId || "");
+        }
+        if (!targetId) throw new Error("Choose an authorized task for microphone-off input.");
+        const session = await apiCall("/native/attach", { method: "POST", signal: controller.signal,
+          body: JSON.stringify({ input_mode: "typed", surface: SDK.desktopOwner ? "desktop" : "dashboard",
+            target_id: targetId, tab_id: tabId.current }) });
+        if (controller.signal.aborted || epoch !== connectionEpoch.current) {
+          if (session?.task) makeTransport(session, {}).stop();
+          throw new Error("Connection cancelled.");
+        }
+        if (session?.ok !== true || session.input_mode !== "typed" || session.task?.target_id !== targetId ||
+            session.task.tab_id !== tabId.current || typeof session.task.connection_id !== "string" ||
+            !Number.isSafeInteger(session.task.generation)) {
+          if (session?.task) makeTransport(session, {}).stop();
+          throw new Error("Microphone-off task binding did not match the selected owner.");
+        }
+        await installSession(session, epoch, true);
+        return transportRef.current;
+      })();
+      textSessionRef.current = pending;
+      try { return await pending; }
+      finally {
+        if (textSessionRef.current === pending) textSessionRef.current = null;
+        if (sessionAbort.current === controller) sessionAbort.current = null;
+      }
+    }
+
+    async function refreshRecipients() {
+      if (recipientBusy.current) return;
+      const epoch = connectionEpoch.current;
+      const request = ++recipientEpoch.current;
+      recipientBusy.current = true;
+      setRecipientLoading(true);
+      setRecipientError("");
       try {
-        const sent = await transport.sendTyped(typed);
-        if (epoch === connectionEpoch.current && sent) setTyped("");
-      } catch (err) { if (epoch === connectionEpoch.current) handleError(err); }
-      finally { if (epoch === connectionEpoch.current) setSending(false); }
+        const transport = await ensureTextBinding();
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return;
+        const response = await transport.task.request("/recipients/catalog", { limit: 20 });
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return;
+        if (response?.ok !== true || !Array.isArray(response.recipients) || response.recipients.length > 50) {
+          throw new Error("Recipient catalog is unavailable.");
+        }
+        const ids = new Set();
+        for (const row of response.recipients) {
+          recipientIdentity(row);
+          if (ids.has(row.recipient_id) || !Array.isArray(row.operations)) throw new Error("Recipient catalog has ambiguous identities.");
+          ids.add(row.recipient_id);
+        }
+        setRecipients(response.recipients);
+        setRecipientSources(response.sources || []);
+        const selected = response.recipients.find(row => sameRecipient(row, confirmedRecipient.current));
+        if (!selected) {
+          confirmedRecipient.current = null;
+        }
+      } catch (err) { if (epoch === connectionEpoch.current) setRecipientError(errorText(err)); }
+      finally {
+        recipientBusy.current = false;
+        if (epoch === connectionEpoch.current) setRecipientLoading(false);
+      }
+    }
+
+    async function setRecipient(id) {
+      if (recipientBusy.current) return false;
+      // Owner addressing is the default, not a host recipient: clearing it is
+      // local state only. Bumping the epoch drops receipts still in flight for
+      // the recipient being left. The voice owner is untouched either way.
+      if (!id) {
+        recipientEpoch.current++;
+        confirmedRecipient.current = null;
+        updateRecipient("");
+        setSelectedJob(null);
+        updateOperation("message");
+        setRecipientHistory(null);
+        setRecipientError("");
+        return true;
+      }
+      const row = recipients.find(item => item.recipient_id === id);
+      if (!row || row.available === false) return false;
+      const target = recipientIdentity(row);
+      const epoch = connectionEpoch.current;
+      const request = ++recipientEpoch.current;
+      recipientBusy.current = true;
+      setRecipientLoading(true);
+      setRecipientError("");
+      setRecipientHistory(null);
+      try {
+        const transport = await ensureTextBinding();
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return false;
+        const response = await transport.task.request("/recipients/select", { ...target, action_id: clientId("select_") });
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return false;
+        if (response?.ok !== true || !sameRecipient(response.recipient, target)) {
+          throw new Error("Recipient selection was not confirmed. Refresh before sending.");
+        }
+        confirmedRecipient.current = target;
+        updateRecipient(id);
+        setSelectedJob(null);
+        updateOperation(row.read_only ? "read" : "message");
+        return true;
+      } catch (err) {
+        if (epoch === connectionEpoch.current) {
+          confirmedRecipient.current = null;
+          setRecipientError(errorText(err));
+        }
+        return false;
+      } finally {
+        recipientBusy.current = false;
+        if (epoch === connectionEpoch.current) setRecipientLoading(false);
+      }
+    }
+
+    function setRecipientOperation(operation) {
+      if (!["read", "message", "start_worker", "steer"].includes(operation)) return;
+      recipientEpoch.current++;
+      updateOperation(operation);
+      setActionReceipt(null);
+    }
+
+    async function readRecipient() {
+      const row = recipients.find(item => item.recipient_id === selectedRecipient);
+      if (!row?.operations.includes("history") || row.available === false) return;
+      const target = recipientIdentity(row);
+      const epoch = connectionEpoch.current, request = ++recipientEpoch.current;
+      setRecipientHistory(null);
+      setRecipientError("");
+      try {
+        const transport = await ensureTextBinding();
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return;
+        const response = await transport.task.request("/recipients/history", { ...target, limit: 20 });
+        if (epoch !== connectionEpoch.current || request !== recipientEpoch.current) return;
+        if (response?.ok !== true || !sameRecipient(response, target) || !Array.isArray(response.messages) ||
+            response.messages.length > 50 || response.messages.some(message =>
+              !["user", "assistant"].includes(message.role) || typeof message.text !== "string")) {
+          throw new Error("History did not match the addressed recipient.");
+        }
+        setRecipientHistory(response);
+      } catch (err) {
+        if (epoch === connectionEpoch.current && request === recipientEpoch.current) setRecipientError(errorText(err));
+      }
+    }
+
+    const selectedRecipientRow = recipients.find(row => row.recipient_id === selectedRecipient);
+    const selectedJobRow = taskState?.jobs?.find(job => job.run_id === selectedJob);
+    const operationSupported = inputCapabilities?.operations?.includes(recipientOperation) === true;
+    /**
+     * Owner text only leaves /live/typed for /text/input when the descriptor
+     * actually declares "message". A descriptor that omits it (cancel/approval
+     * only) routes owner text exactly as an absent descriptor does.
+     */
+    const ownerMessageSupported = inputCapabilities?.operations?.includes("message") === true;
+    const recipientCanSend = selectedRecipientRow?.send_agent_message === "direct" &&
+      selectedRecipientRow.proven_control !== "none" && selectedRecipientRow.read_only !== true &&
+      selectedRecipientRow.available !== false && sameRecipient(selectedRecipientRow, confirmedRecipient.current);
+    const legacyText = !selectedRecipient && recipientOperation === "message" &&
+      transportRef.current && !transportRef.current.textOnly && phase === "active";
+    const ownerText = !selectedRecipient && recipientOperation === "message" &&
+      Boolean(SDK.prepareTask || selectedTask);
+    const canSendTyped = !switching && !recipientLoading && !sending && attachments.length === 0 &&
+      (legacyText || ownerText || operationSupported && (recipientOperation === "start_worker" ||
+        recipientOperation === "steer" && selectedJobRow?.steering?.supported === true ||
+        recipientOperation === "message" && (!selectedRecipient || recipientCanSend)));
+
+    async function sendTyped() {
+      const draft = { ...draftRef.current, files: [...draftRef.current.files] };
+      if (!draft.text.trim() || sendingRef.current || !canSendTyped ||
+          (transportRef.current?.typedOperations?.size || 0) >= 8) return false;
+      const epoch = connectionEpoch.current, addressedEpoch = recipientEpoch.current;
+      const recipient = selectedRecipientRow ? recipientIdentity(selectedRecipientRow) : null;
+      const operation = recipientOperation, runId = selectedJob;
+      const current = () => epoch === connectionEpoch.current && mounted.current;
+      sendingRef.current = true;
+      setSending(true);
+      setInputError("");
+      let sent = false;
+      try {
+        const transport = legacyText && !ownerMessageSupported ? transportRef.current : await ensureTextBinding();
+        if (!current()) return false;
+        if (legacyText && !ownerMessageSupported) {
+          sent = await transport.sendTyped(draft.text);
+        } else if (ownerText && !ownerMessageSupported) {
+          const signature = JSON.stringify([draft.revision, transport.task.context]);
+          if (submissionRef.current?.signature !== signature) submissionRef.current = { signature,
+            body: { provider_session_id: captureSession.current, input_id: clientId("typed_"),
+              text: draft.text, admission: "async" } };
+          const body = submissionRef.current.body;
+          const receipt = await transport.task.request("/live/typed", body);
+          if (receipt?.ok !== true || typeof receipt.operation_id !== "string" || !receipt.operation_id ||
+              !["admitted", "deciding", "dispatching", "completed", "uncertain", "failed"].includes(receipt.state)) {
+            throw new Error("Typed admission is unconfirmed. Retry this unchanged input to reconcile it.");
+          }
+          if (!transport.typedOperations) transport.typedOperations = new Map();
+          transport.typedOperations.set(receipt.operation_id, body.input_id);
+          if (current() && addressedEpoch === recipientEpoch.current) setActionReceipt({ ...receipt, operation: "message" });
+          sent = !["uncertain", "failed"].includes(receipt.state);
+          if (current()) await pollTypedOperations(transport);
+        } else {
+          const signature = JSON.stringify([draft.revision, operation, recipient, runId, transport.task.context]);
+          if (submissionRef.current?.signature !== signature) submissionRef.current = { signature,
+            body: { input_id: clientId("typed_"), text: draft.text, operation, attachments: [],
+              ...(recipient && operation === "message" ? { recipient } : {}),
+              ...(operation === "steer" ? { run_id: runId } : {}) } };
+          const body = submissionRef.current.body;
+          const receipt = await transport.task.request("/text/input", body);
+          if (receipt?.ok !== true || receipt.input_id !== body.input_id || receipt.operation !== operation ||
+              (body.recipient && !sameRecipient(receipt.recipient, body.recipient)) || typeof receipt.state !== "string") {
+            throw new Error("Input receipt was not confirmed. Inspect the task before retrying.");
+          }
+          if (current() && addressedEpoch === recipientEpoch.current) setActionReceipt(receipt);
+          sent = ["queued", "posted", "accepted", "completed", "saved"].includes(receipt.state);
+          if (!sent && current()) setInputError("Input delivery is " + receipt.state + ". Inspect the task before retrying.");
+          // An owner message admitted asynchronously settles through the same /live/operation
+          // polling the provider-free typed path uses; the reply names the operation to watch.
+          if (sent && typeof receipt.operation_id === "string" && receipt.operation_id) {
+            if (!transport.typedOperations) transport.typedOperations = new Map();
+            transport.typedOperations.set(receipt.operation_id, body.input_id);
+            if (current()) await pollTypedOperations(transport);
+          }
+        }
+        if (current() && addressedEpoch === recipientEpoch.current && sent && draft.revision === draftRef.current.revision) {
+          setTyped("");
+        }
+        return sent;
+      } catch (err) { if (current()) setInputError(errorText(err)); return false; }
+      finally {
+        sendingRef.current = false;
+        if (current()) setSending(false);
+      }
+    }
+
+    async function pollTypedOperations(transport) {
+      if (!transport.typedOperations?.size || transport.typedPolling) return;
+      transport.typedPolling = true;
+      const epoch = connectionEpoch.current;
+      try {
+        for (const [operationId, inputId] of [...transport.typedOperations].slice(0, 8)) {
+          const query = "?connection_id=" + encodeURIComponent(transport.task.context.connection_id) +
+            "&generation=" + encodeURIComponent(transport.task.context.generation) +
+            "&operation_id=" + encodeURIComponent(operationId);
+          const reply = await transport.task.request("/live/operation" + query, null, "GET");
+          if (epoch !== connectionEpoch.current || transport !== transportRef.current) return;
+          if (reply?.ok !== true || reply.operation_id !== operationId || typeof reply.pending !== "boolean") {
+            throw new Error("Typed operation receipt did not match this input.");
+          }
+          setActionReceipt({ ...reply, input_id: inputId, operation: "message" });
+          if (!reply.pending) {
+            transport.typedOperations.delete(operationId);
+            if (reply.result?.run_id != null) {
+              setResults(rows => ({ ...rows, [reply.result.run_id]: reply.result }));
+            } else if (typeof reply.result?.output === "string") {
+              appendTranscript("assistant", reply.result.output, true, { event_id: operationId });
+            }
+          }
+        }
+      } catch (err) { if (epoch === connectionEpoch.current) setInputError(errorText(err)); }
+      finally { transport.typedPolling = false; }
+    }
+
+    function steerJob(runId) {
+      const job = latestTaskState.current?.jobs?.find(row => row.run_id === runId);
+      if (!job || job.steering?.supported !== true || !inputCapabilities?.operations?.includes("steer")) return;
+      setSelectedJob(runId);
+      setRecipientOperation("steer");
+    }
+
+    async function submitJobAction(key, operation, fields, text) {
+      if (!inputCapabilities?.operations?.includes(operation) || actionLocks.current.has(key)) return false;
+      const epoch = connectionEpoch.current;
+      actionLocks.current.add(key);
+      setPendingActions(rows => ({ ...rows, [key]: { pending: true, error: "" } }));
+      try {
+        const transport = await ensureTextBinding();
+        if (epoch !== connectionEpoch.current) return false;
+        const signature = JSON.stringify([fields, transport.task.context]);
+        let request = actionRequests.current.get(key);
+        if (request?.signature !== signature) {
+          request = { signature, body: { ...fields, input_id: clientId("action_"), operation, text, attachments: [] } };
+          actionRequests.current.set(key, request);
+        }
+        if (request.completed) return true;
+        const body = request.body;
+        const receipt = await transport.task.request("/text/input", body);
+        if (epoch !== connectionEpoch.current) return false;
+        if (receipt?.ok !== true || receipt.input_id !== body.input_id || receipt.operation !== operation ||
+            !["queued", "posted", "accepted", "completed", "saved"].includes(receipt.state)) {
+          throw new Error("Action is unconfirmed. Refresh the original task before trying again.");
+        }
+        setActionReceipt(receipt);
+        request.completed = true;
+        setPendingActions(rows => ({ ...rows, [key]: { pending: false, error: "" } }));
+        await transport.task.refresh();
+        return true;
+      } catch (err) {
+        if (epoch === connectionEpoch.current) setPendingActions(rows => ({ ...rows,
+          [key]: { pending: false, error: errorText(err) } }));
+        return false;
+      } finally { actionLocks.current.delete(key); }
+    }
+
+    function cancelJob(runId) {
+      const job = latestTaskState.current?.jobs?.find(row => row.run_id === runId);
+      if (!job || !["queued", "accepted", "running", "waiting_for_approval"].includes(job.status)) return false;
+      return submitJobAction("cancel:" + runId, "cancel", { run_id: runId, action_id: job.action_id }, "Cancel this job.");
+    }
+
+    function answerApproval(answer) {
+      const job = latestTaskState.current?.jobs?.find(row => row.run_id === answer.run_id && row.action_id === answer.action_id);
+      const pending = job?.approval?.approvals?.find(row => row.request_id === answer.request_id);
+      if (job?.approval?.actionable !== true || !pending?.choices?.includes(answer.choice)) return false;
+      return submitJobAction("approval:" + answer.request_id, "approval", { run_id: answer.run_id,
+        action_id: answer.action_id, request_id: answer.request_id, choice: answer.choice }, answer.choice);
+    }
+
+    async function replayResult(eventId) {
+      const transport = transportRef.current;
+      const job = taskState?.jobs?.find(row => row.presentation?.event_id === eventId && row.presentation.replay_eligible);
+      if (!transport?.task || transport.textOnly || transport.live || !job || actionLocks.current.has("replay:" + eventId)) return;
+      const epoch = connectionEpoch.current, key = "replay:" + eventId;
+      actionLocks.current.add(key);
+      setPendingActions(rows => ({ ...rows, [key]: { pending: true, error: "" } }));
+      try {
+        const played = await transport.task.presentation.replay(eventId);
+        if (!played) throw new Error("Summary is not ready to replay. Try again in a quiet turn.");
+        if (epoch === connectionEpoch.current) setPendingActions(rows => ({ ...rows, [key]: { pending: false, error: "" } }));
+      } catch (err) {
+        if (epoch === connectionEpoch.current) setPendingActions(rows => ({ ...rows, [key]: { pending: false, error: errorText(err) } }));
+      } finally { actionLocks.current.delete(key); }
     }
 
     async function showResult(runId) {
+      // Opening a stored result is a read. It must never mint a binding, so a
+      // click without one is inert and the control says why instead.
       const transport = transportRef.current;
       const epoch = connectionEpoch.current;
-      if (!transport || !transport.task) return;
+      if (!transport?.task) return;
       try {
         const result = await transport.task.result(runId);
         if (epoch === connectionEpoch.current) setResults((prev) => Object.assign({}, prev, { [runId]: result }));
@@ -2197,6 +2826,17 @@ function createTalkSurface(SDK) {
       tasks, selectedTask, taskState, transcript, results, typed, sending, switching,
       returnDepth, bound, voice, startTalk, stopTalk, refresh, setTyped, sendTyped,
       switchTarget, showResult, saveUpdatePreference, setVoice,
+      voiceOwner: SDK.desktopOwner, recipients, selectedRecipient, recipientOperation,
+      setRecipient, setRecipientOperation, recipientQuery, setRecipientQuery, recipientHistory,
+      readRecipient, refreshRecipients, recipientLoading, recipientSources, recipientError,
+      attachments, addAttachments, removeAttachment, attachmentsSupported: false,
+      canSendTyped: Boolean(canSendTyped), inputCapabilities, inputError, actionReceipt,
+      replaySupported: Boolean(transportRef.current && !transportRef.current.live && !transportRef.current.textOnly),
+      resultsReadable: Boolean(transportRef.current?.task),
+      selectedJob, pendingActions, cancelJob, steerJob, answerApproval, replayResult,
+      muted, sleeping, setMuted, setSleeping, appearance, setAppearance,
+      audioActivity: { input: !muted && !sleeping && active && audioActivity.input,
+        output: !sleeping && active && audioActivity.output },
       refreshCatalog: () => { setCatalogReload((value) => value + 1); void refresh(); },
     });
 
@@ -2400,9 +3040,10 @@ function createTalkSurface(SDK) {
           results[job.run_id] && results[job.run_id].truncated && h("div", { className: "ht-out" }, "Result truncated by transport.")))),
 
       h("form", { className: "ht-token-row", onSubmit: (event) => { event.preventDefault(); void sendTyped(); } },
-        h(C.Input, { value: typed, disabled: !active || sending, placeholder: "Type to this Talk connection",
+        h(C.Input, { value: typed, disabled: sending || switching, placeholder: "Type to this Talk connection",
           "aria-label": "Typed input", onChange: (e) => setTyped(e.target.value) }),
-        h(C.Button, { type: "submit", disabled: !active || sending || !typed.trim() }, sending ? "Staging…" : "Send")),
+        h(C.Button, { type: "submit", disabled: !canSendTyped || !typed.trim() }, sending ? "Staging…" : "Send")),
+      inputError && h("div", { role: "alert", className: "ht-error" }, inputError),
 
       h("div", { className: "ht-grid" },
         h("section", { className: "ht-card" },
