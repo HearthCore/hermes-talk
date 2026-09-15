@@ -58,6 +58,8 @@ _WALL_CLOCK_TESTS = {
     },
     "test_dashboard_tasks.py": {
         "test_actual_frontend_event_wire_roundtrips_through_coordinator",
+        # Future.result(timeout) against a scripted host; twice red on Windows CI in one day.
+        "test_first_completed_observation_is_ready_without_transcript_linking",
     },
 }
 
