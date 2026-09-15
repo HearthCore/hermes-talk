@@ -194,6 +194,7 @@ class BoundDashboard:
     speech_timing: SpeechTiming | None = None
     native_surface: object = field(default=None, repr=False)
     capabilities_checked_at: float = field(default_factory=time.monotonic)
+    joined_at: float = field(default_factory=time.time)
 
     @property
     def token(self):
@@ -985,8 +986,6 @@ class DashboardTasks:
             if action["name"] == "steer_work":
                 with suppress(DashboardTaskError, HistoryError):
                     steer_action(self, bound, action)
-                    record = bound.stages.get(bound.token, action["interaction_id"])
-                    self._link_origin(bound, record)
         jobs = []
         candidates = [action for action in actions if action.get("api_run_id")]
         with self._lock:
@@ -1020,6 +1019,7 @@ class DashboardTasks:
                 continue
             try:
                 status = bound.gateway.run(action["api_run_id"])
+                self._result_owner(bound, action, status)
                 bound.stages.record_original_receipt(
                     action,
                     last_status=status.get("status"),
@@ -1029,14 +1029,15 @@ class DashboardTasks:
                 record = next(
                     (row for row in interactions if row["id"] == action["interaction_id"]), None
                 )
-                receipt = self._link_origin(bound, record) if record else None
+                self._project_job(bound, action, status, record)
                 job = {
                     "run_id": action["run_id"],
                     "action_id": action["action_id"],
                     "status": status.get("status"),
                     "goal": action.get("goal", ""),
                     "origin_turn_id": record["origin_turn_id"] if record else None,
-                    "canonical_message_ids": list(receipt.message_ids) if receipt else [],
+                    "canonical_message_ids": record.get("canonical_message_ids", []) if record
+                    else [],
                     "child_session_id": status.get("child_session_id"),
                     "result_available": status.get("status")
                     in {"completed", "failed", "cancelled"},
@@ -1058,7 +1059,6 @@ class DashboardTasks:
                         "reason": exc.code,
                         "actionable": False,
                     }
-                self._project_job(bound, action, status, record)
                 jobs.append(job)
             except (DashboardTaskError, HistoryError) as exc:
                 jobs.append(
@@ -1070,6 +1070,9 @@ class DashboardTasks:
                         "error": getattr(exc, "code", "gateway_unavailable"),
                     }
                 )
+        presentations = bound.events.job_presentations(bound.token)
+        for job in jobs:
+            job["presentation"] = presentations.get(job["run_id"])
         interactions, actions = bound.stages.records(bound.token)
         visible = []
         for record in interactions:
@@ -1174,7 +1177,10 @@ class DashboardTasks:
             prior = bound.job_observations.get(action["run_id"])
             bound.events.observe_poll(
                 bound.token, lease, action["run_id"], status,
-                live=prior is not None and prior != signature,
+                live=(prior is not None and prior != signature) or (
+                    prior is None and status.get("status") in TaskEvents.TERMINAL
+                    and action["created_at"] >= bound.joined_at
+                ),
             )
             bound.job_observations[action["run_id"]] = signature
 
@@ -1235,14 +1241,28 @@ class DashboardTasks:
 
     def speech(self, request, body):
         bound = self.binding(request, body, write=True)
+        replay = body.get("replay", False)
+        protocol = body.get("presentation_protocol", 0)
+        playback = body.get("playback_supported", False)
+        if (type(replay) is not bool or type(protocol) is not int or protocol not in {0, 1}
+                or type(playback) is not bool or (replay and protocol != 1)):
+            raise DashboardTaskError("invalid_event", 400)
         if body.get("timing") is None:
             return {"ok": True, "speak": False, "reason": "timing_unavailable"}
         with self._lock:
             if not bound.speech_timing.observe(bound.token, body["timing"]):
                 return {"ok": True, "speak": False, "reason": "speech_busy"}
         bound.attachment.refresh_snapshot(bound.token)
-        event = next((item for item in bound.events.speech_candidates(bound.token)
-                      if item["event_id"] == body.get("event_id")), None)
+        if replay:
+            try:
+                event = bound.events.replay_event(bound.token, body.get("event_id"))
+            except TaskEventError as exc:
+                if exc.code in {"replay_not_speakable", "missing_reference"}:
+                    return {"ok": True, "speak": False}
+                raise
+        else:
+            event = next((item for item in bound.events.speech_candidates(bound.token)
+                          if item["event_id"] == body.get("event_id")), None)
         if event is None:
             return {"ok": True, "speak": False}
         action = bound.stages.action(bound.token, event["run_id"])
@@ -1270,14 +1290,15 @@ class DashboardTasks:
         }
         self.binding(request, body, write=True)
         # Recheck the saved preference after host reads, before claiming speech.
-        if not any(item["event_id"] == event["event_id"]
-                   for item in bound.events.speech_candidates(bound.token)):
+        if not replay and not any(item["event_id"] == event["event_id"]
+                                  for item in bound.events.speech_candidates(bound.token)):
             return {"ok": True, "speak": False}
         if not bound.speech_timing.ready(bound.token):
             return {"ok": True, "speak": False, "reason": "timing_stale"}
         try:
             attempt = bound.events.queue_speech(
-                bound.token, event["event_id"], respect_preference=True
+                bound.token, event["event_id"], respect_preference=True,
+                playback_supported=playback, presentation_protocol=protocol, replay=replay,
             )
         except TaskEventError as exc:
             if exc.code in {"delivery_exists", "replay_not_speakable"}:
@@ -1287,6 +1308,8 @@ class DashboardTasks:
         return {
             "ok": True, "speak": True, "event_id": attempt.event_id,
             "attempt_id": attempt.attempt_id, "run_id": action["run_id"], "result": full,
+            "operation_id": action["action_id"],
+            "presentation": bound.events.presentation(bound.token, attempt.event_id),
             "response": {
                 "conversation": "none", "tools": [], "tool_choice": "none",
                 "max_output_tokens": 220,
@@ -1316,9 +1339,12 @@ class DashboardTasks:
         if body.get("state") == "deferred":
             bound.events.defer_speech(bound.token, attempt)
         else:
-            bound.events.acknowledge_speech(bound.token, attempt, body.get("state"))
+            bound.events.acknowledge_speech(
+                bound.token, attempt, body.get("state"), response_id=body.get("response_id")
+            )
         self.binding(request, body)
-        return {"ok": True, "state": body["state"]}
+        return {"ok": True, "state": body["state"],
+                "presentation": bound.events.presentation(bound.token, attempt.event_id)}
 
     def close(self, request, body):
         bound = self.binding(request, body)

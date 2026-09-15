@@ -2793,7 +2793,8 @@ async def run_native_talk_session(
                     loop.call_soon_threadsafe(put)
             keyboard_stop = start_native_keyboard_control(deliver)
         emit({"controls": "Type a message; /targets, /select ID, /return, /reconnect, "
-              "/state, /result ID, /preference MODE, /pause, /resume, /interrupt. "
+              "/state, /result ID, /replay EVENT_ID, /preference MODE, "
+              "/pause, /resume, /interrupt. "
               "Enter pauses/resumes; Ctrl+C hangs up."})
 
         async def receive():

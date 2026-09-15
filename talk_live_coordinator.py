@@ -26,6 +26,32 @@ UNCERTAIN_OUTPUT = (
     "The original task decision is pending or unconfirmed. No duplicate was started. "
     "Inspect the task before giving a fresh instruction."
 )
+PRESENTATION_SECONDS = 30.0
+
+
+def operation_presentation(operation):
+    ready = operation["state"] not in PENDING_STATES and operation.get("result") is not None
+    result = operation.get("result") or {}
+    presentation = {
+        "event_id": operation["operation_id"],
+        "operation_id": operation["operation_id"],
+        "run_id": (result.get("action") or {}).get("run_id"),
+        "attempt_id": None,
+        "state": "result_ready" if ready else "unclaimed",
+        "result_ready": ready,
+        "context_submitted": False,
+        "playback_started": False,
+        "playback_finished": False,
+        "interrupted": False,
+        "unknown": False,
+        "response_id": None,
+        "replay_eligible": False,
+        "retry_at": None,
+        "claim_expires_at": None,
+    }
+    stored = operation.get("presentation") or {}
+    presentation.update({key: stored[key] for key in presentation if key in stored})
+    return presentation
 
 
 def protocol_id(value):
@@ -449,14 +475,68 @@ class LiveLedger:
             return operation, claimed
 
     def operation(self, operation_id):
-        with self.bound.stages._db(self.bound.token, write=False) as db:
+        with self.bound.stages._db(self.bound.token) as db:
             row = db.execute(
                 "SELECT record FROM live_operations WHERE id=? AND owner=? AND tab_id=?",
                 (operation_id, *self.scope),
             ).fetchone()
             if row is None:
                 raise DashboardTaskError("result_unavailable", 404)
-            return json.loads(row[0])
+            operation = json.loads(row[0])
+            presentation = operation.get("presentation")
+            if presentation and presentation["state"] in {"submitting", "context_submitted"}:
+                expired = (presentation["state"] == "submitting"
+                           and presentation["claim_expires_at"] <= self.bound.stages.clock())
+                if expired or presentation["generation"] != self.bound.token.generation:
+                    presentation.update(state="unknown", unknown=True, claim_expires_at=None)
+                    db.execute(
+                        "UPDATE live_operations SET record=? WHERE id=?",
+                        (self.bound.stages._encode(operation), operation_id),
+                    )
+            return operation
+
+    def presentation(self, operation_id, session, *, state, attempt_id=None):
+        if state not in {"submitting", "context_submitted", "unknown"}:
+            raise DashboardTaskError("invalid_event", 400)
+        with self.bound.stages._db(self.bound.token) as db:
+            row = db.execute(
+                "SELECT record FROM live_operations WHERE id=? AND owner=? AND tab_id=?",
+                (operation_id, *self.scope),
+            ).fetchone()
+            if row is None:
+                raise DashboardTaskError("result_unavailable", 404)
+            operation = json.loads(row[0])
+            presentation = operation.get("presentation")
+            if state == "submitting":
+                if attempt_id is not None:
+                    raise DashboardTaskError("invalid_event", 400)
+                if presentation or not operation_presentation(operation)["result_ready"]:
+                    return operation, False
+                presentation = operation_presentation(operation)
+                presentation.update(
+                    state="submitting", attempt_id=uuid.uuid4().hex,
+                    generation=self.bound.token.generation, session_key=digest(session),
+                    claim_expires_at=self.bound.stages.clock() + PRESENTATION_SECONDS,
+                )
+                operation["presentation"] = presentation
+            else:
+                if (not presentation or presentation["attempt_id"] != attempt_id
+                        or presentation["generation"] != self.bound.token.generation
+                        or presentation["session_key"] != digest(session)):
+                    raise DashboardTaskError("event_conflict", 409)
+                if state == "context_submitted":
+                    presentation["context_submitted"] = True
+                if state == "unknown":
+                    presentation["unknown"] = True
+                presentation.update(
+                    state="unknown" if presentation["unknown"] else state,
+                    claim_expires_at=None,
+                )
+            db.execute(
+                "UPDATE live_operations SET record=? WHERE id=?",
+                (self.bound.stages._encode(operation), operation_id),
+            )
+            return operation, state == "submitting"
 
     def finish(self, original, state, result=None):
         """Receipt-only updates survive audio retirement; they cannot create or replay work."""
@@ -644,7 +724,19 @@ class LiveCoordinator:
             "result": result,
             "kind": "commentary",
             "output": PENDING_OUTPUT if pending else (result or {}).get("output", UNCERTAIN_OUTPUT),
+            "presentation": operation_presentation(operation),
         }
+
+    def presentation(self, request, body):
+        bound = self.manager.binding(request, body, write=True)
+        operation, speak = LiveLedger(bound).presentation(
+            protocol_id(body.get("operation_id")),
+            protocol_id(body.get("provider_session_id")),
+            state=body.get("state"),
+            attempt_id=body.get("attempt_id"),
+        )
+        self.manager.binding(request, body)
+        return {"ok": True, "speak": speak, "presentation": operation_presentation(operation)}
 
     def _admit(self, request, body, session, delegation, fragments, offset):
         bound = self.manager.binding(request, body, write=True)

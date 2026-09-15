@@ -432,6 +432,11 @@ def test_proactive_result_uses_quiet_timing_and_records_sent_not_heard(environme
         with fixture.bound.events._db(fixture.bound.token) as db:
             rows = db.execute("SELECT state,playback_supported FROM task_event_speech").fetchall()
         assert len(rows) == 1 and tuple(rows[0]) == ("sent", 0)
+        state = fixture.registry.manager.state(fixture.request, fixture.context)
+        presentation = state["jobs"][0]["presentation"]
+        assert presentation["state"] == "context_submitted"
+        assert presentation["result_ready"] and presentation["context_submitted"]
+        assert not presentation["playback_started"] and not presentation["playback_finished"]
         assert len(fixture.host.jobs) == 1
         await fixture.registry.close_all()
 
