@@ -17,6 +17,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 try:
+    from . import talk_input_attachments
     from .talk_attachment import HistoryDelivery, TalkAttachment
     from .talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from .talk_dashboard_store import DashboardStages, bounded_text
@@ -45,6 +46,7 @@ try:
     from .talk_task_sources import TaskEventError
     from .talk_worker_recipients import TalkWorkerRecipients, WorkerRecipientBackend
 except ImportError:  # pragma: no cover - flat plugin load
+    import talk_input_attachments
     from talk_attachment import HistoryDelivery, TalkAttachment
     from talk_dashboard_gateway import DashboardTaskError, RecipientGateway, TaskGateway
     from talk_dashboard_store import DashboardStages, bounded_text
@@ -191,6 +193,11 @@ class BoundDashboard:
     target_record: dict | None = None
     return_depth: int = 0
     job_observations: dict = field(default_factory=dict)
+    #: ``{input_id: {upload_id: receipt}}``. The pin that makes an attachment reference
+    #: admissible. It lives HERE because this object IS the (owner, connection_id,
+    #: generation) identity a reference must match — a new generation gets a new
+    #: binding with no pins, so a stale reference cannot be replayed into it.
+    input_attachments: dict = field(default_factory=dict)
     speech_timing: SpeechTiming | None = None
     native_surface: object = field(default=None, repr=False)
     capabilities_checked_at: float = field(default_factory=time.monotonic)
@@ -230,6 +237,53 @@ class DashboardTasks:
             bound.capabilities = value
             bound.capabilities_checked_at = now
         return value
+
+    def pinned_attachment(self, bound, input_id, upload_id):
+        with self._lock:
+            return bound.input_attachments.get(input_id, {}).get(upload_id)
+
+    def check_attachment_room(self, bound, input_id, upload_id, size, limits):
+        """Would one more file of *size* exceed the host's published per-input bounds?"""
+        with self._lock:
+            self._attachment_room(bound, input_id, upload_id, size, limits)
+
+    @staticmethod
+    def _attachment_room(bound, input_id, upload_id, size, limits):
+        pins = bound.input_attachments.get(input_id, {})
+        others = [row for key, row in pins.items() if key != upload_id]
+        if len(others) + 1 > limits["max_files_per_input"]:
+            raise DashboardTaskError("attachment_size_limit", 413)
+        if sum(row["bytes"] for row in others) + size > limits["max_input_bytes"]:
+            raise DashboardTaskError("attachment_size_limit", 413)
+
+    def pin_attachment(self, bound, input_id, upload_id, receipt, limits):
+        """Commit the reference under this binding, re-checking the bounds atomically."""
+        with self._lock:
+            self._attachment_room(bound, input_id, upload_id, receipt["bytes"], limits)
+            pins = bound.input_attachments.setdefault(input_id, {})
+            if len(bound.input_attachments) > talk_input_attachments.MAX_PINNED_INPUTS:
+                oldest = next(iter(bound.input_attachments))
+                if oldest != input_id:
+                    del bound.input_attachments[oldest]
+            pins[upload_id] = dict(receipt)
+            return dict(receipt)
+
+    def verified_attachments(self, bound, input_id, references):
+        """Every reference must have been uploaded under THIS binding and THIS input.
+
+        A reference from another draft, another tab, or an earlier generation has no
+        pin here, so it is refused before the dispatch body is built.
+        """
+        normalized = talk_input_attachments.normalize_references(references)
+        with self._lock:
+            pinned = {
+                row["attachment_id"]: row["sha256"]
+                for row in bound.input_attachments.get(input_id, {}).values()
+            }
+        for reference in normalized:
+            if pinned.get(reference["attachment_id"]) != reference["sha256"]:
+                raise DashboardTaskError("attachment_reference_unknown", 409)
+        return normalized
 
     def _store_proof(self, gateway, context, target=None):
         if not target or target["peer_id"] == "local":
@@ -729,6 +783,22 @@ class DashboardTasks:
                     if not codex_worker_available(bound.capabilities):
                         raise DashboardTaskError("child_dispatch_unsupported", 409)
                     action["request_body"]["child"]["worker"] = "hermes-talk-codex"
+                references = arguments.get("attachments")
+                if references:
+                    # The one chokepoint every dispatch passes, typed route or model
+                    # call: unpinned references never reach a request body.
+                    child = action["request_body"]["child"]
+                    if (
+                        name != "delegate_task"
+                        or "worker" in child
+                        or not talk_input_attachments.delivers_to_child(bound.capabilities)
+                    ):
+                        # The host does not deliver attachments to an external worker and
+                        # says so; refusing here keeps the words and files unsent.
+                        raise DashboardTaskError("attachment_operation_unsupported", 400)
+                    child["attachments"] = self.verified_attachments(
+                        bound, record["input_id"], references
+                    )
             elif name == "steer_work":
                 if set(arguments) not in ({"run_id"}, {"api_run_id"}):
                     raise DashboardTaskError("invalid_event", 400)

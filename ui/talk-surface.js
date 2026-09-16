@@ -2019,6 +2019,13 @@ function createTalkSurface(SDK) {
       return true;
     }
 
+    function clearSentDraft() {
+      for (const file of draftRef.current.files) if (file.previewUrl) URL.revokeObjectURL(file.previewUrl);
+      draftRef.current = { text: "", files: [], revision: draftRef.current.revision + 1 };
+      updateTyped("");
+      updateAttachments([]);
+    }
+
     function removeAttachment(id) {
       const old = draftRef.current.files.find(file => file.id === id);
       if (old?.previewUrl) URL.revokeObjectURL(old.previewUrl);
@@ -2605,6 +2612,13 @@ function createTalkSurface(SDK) {
      * only) routes owner text exactly as an absent descriptor does.
      */
     const ownerMessageSupported = inputCapabilities?.operations?.includes("message") === true;
+    /**
+     * Files ride only where the plugin says an upload adapter exists AND the
+     * operation is the one whose dispatch reaches a child. Anything else keeps the
+     * existing behavior: the files stay local and Send is disabled with a reason.
+     */
+    const attachmentsSupported = inputCapabilities?.attachments === true;
+    const attachmentsSendable = attachmentsSupported && recipientOperation === "start_worker";
     const recipientCanSend = selectedRecipientRow?.send_agent_message === "direct" &&
       selectedRecipientRow.proven_control !== "none" && selectedRecipientRow.read_only !== true &&
       selectedRecipientRow.available !== false && sameRecipient(selectedRecipientRow, confirmedRecipient.current);
@@ -2612,10 +2626,44 @@ function createTalkSurface(SDK) {
       transportRef.current && !transportRef.current.textOnly && phase === "active";
     const ownerText = !selectedRecipient && recipientOperation === "message" &&
       Boolean(SDK.prepareTask || selectedTask);
-    const canSendTyped = !switching && !recipientLoading && !sending && attachments.length === 0 &&
+    const canSendTyped = !switching && !recipientLoading && !sending &&
+      (attachments.length === 0 || attachmentsSendable) &&
       (legacyText || ownerText || operationSupported && (recipientOperation === "start_worker" ||
         recipientOperation === "steer" && selectedJobRow?.steering?.supported === true ||
         recipientOperation === "message" && (!selectedRecipient || recipientCanSend)));
+
+    function base64Of(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + 0x8000));
+      }
+      return btoa(binary);
+    }
+
+    /**
+     * Upload happens on Send, never while editing. Each file goes to the plugin's
+     * own adapter — never the credentialed host endpoint — and comes back as an
+     * opaque reference pinned to this input. A failure throws before /text/input is
+     * called, so a partial upload sends nothing; the retry reuses the same input_id,
+     * and the already-stored files replay their receipts instead of storing twice.
+     */
+    async function uploadAttachments(transport, files, inputId) {
+      const references = [];
+      for (const entry of files) {
+        const reply = await transport.task.request("/attachments/upload", {
+          input_id: inputId, filename: entry.name,
+          content_type: entry.type || "application/octet-stream",
+          bytes_base64: base64Of(await entry.file.arrayBuffer()),
+        });
+        if (reply?.ok !== true || reply.input_id !== inputId ||
+            typeof reply.attachment_id !== "string" || typeof reply.sha256 !== "string") {
+          throw new Error("An attachment upload was not confirmed. Nothing was sent.");
+        }
+        references.push({ attachment_id: reply.attachment_id, sha256: reply.sha256 });
+      }
+      return references;
+    }
 
     async function sendTyped() {
       const draft = { ...draftRef.current, files: [...draftRef.current.files] };
@@ -2653,10 +2701,19 @@ function createTalkSurface(SDK) {
         } else {
           const signature = JSON.stringify([draft.revision, operation, recipient, runId, transport.task.context]);
           if (submissionRef.current?.signature !== signature) submissionRef.current = { signature,
+            files: attachmentsSendable ? draft.files : [], uploaded: false,
             body: { input_id: clientId("typed_"), text: draft.text, operation, attachments: [],
               ...(recipient && operation === "message" ? { recipient } : {}),
               ...(operation === "steer" ? { run_id: runId } : {}) } };
-          const body = submissionRef.current.body;
+          const pending = submissionRef.current;
+          if (pending.files?.length && !pending.uploaded) {
+            // The captured send owns these exact files; the references complete it.
+            pending.body.attachments = await uploadAttachments(
+              transport, pending.files, pending.body.input_id);
+            pending.uploaded = true;
+            if (!current()) return false;
+          }
+          const body = pending.body;
           const receipt = await transport.task.request("/text/input", body);
           if (receipt?.ok !== true || receipt.input_id !== body.input_id || receipt.operation !== operation ||
               (body.recipient && !sameRecipient(receipt.recipient, body.recipient)) || typeof receipt.state !== "string") {
@@ -2674,7 +2731,7 @@ function createTalkSurface(SDK) {
           }
         }
         if (current() && addressedEpoch === recipientEpoch.current && sent && draft.revision === draftRef.current.revision) {
-          setTyped("");
+          clearSentDraft();
         }
         return sent;
       } catch (err) { if (current()) setInputError(errorText(err)); return false; }
@@ -2825,7 +2882,7 @@ function createTalkSurface(SDK) {
       voiceOwner: SDK.desktopOwner, recipients, selectedRecipient, recipientOperation,
       setRecipient, setRecipientOperation, recipientQuery, setRecipientQuery, recipientHistory,
       readRecipient, refreshRecipients, recipientLoading, recipientSources, recipientError,
-      attachments, addAttachments, removeAttachment, attachmentsSupported: false,
+      attachments, addAttachments, removeAttachment, attachmentsSupported,
       canSendTyped: Boolean(canSendTyped), inputCapabilities, inputError, actionReceipt,
       replaySupported: Boolean(transportRef.current && !transportRef.current.live && !transportRef.current.textOnly),
       resultsReadable: Boolean(transportRef.current?.task),

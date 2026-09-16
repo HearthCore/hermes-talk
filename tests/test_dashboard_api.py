@@ -588,6 +588,7 @@ def test_route_handlers_covers_every_declared_route():
         DASHBOARD_DIR / "plugin_api.py", DASHBOARD_DIR.parent / "talk_live_routes.py",
         DASHBOARD_DIR.parent / "talk_recipients.py",
         DASHBOARD_DIR.parent / "talk_text_input.py",
+        DASHBOARD_DIR.parent / "talk_input_attachments.py",
     ))
     decorated = re.findall(r"@router\.(?:get|post|put|patch|delete)\(", source)
 

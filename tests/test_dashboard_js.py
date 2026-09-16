@@ -62,7 +62,9 @@ const window = {
   sessionStorage: { getItem() { return ""; }, setItem() {} }, setTimeout, clearTimeout,
 };
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
-  window, setTimeout, clearTimeout, AbortController, console,
+  // btoa is a browser global, not an ECMAScript intrinsic, so a fresh vm context
+  // lacks it. Attachment encoding uses it exactly as a page would.
+  window, setTimeout, clearTimeout, AbortController, console, btoa,
 }, { filename: "index.js" });
 const Transport = window.__HERMES_TALK_TEST__.TalkTransport;
 const make = (generation = 3) => {
@@ -429,7 +431,9 @@ fetchOverride = (url, body) => {
   }
 };
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
-  window, setTimeout, clearTimeout, AbortController, console,
+  // btoa is a browser global, not an ECMAScript intrinsic, so a fresh vm context
+  // lacks it. Attachment encoding uses it exactly as a page would.
+  window, setTimeout, clearTimeout, AbortController, console, btoa,
   document: { title: "Dashboard task page" }, navigator: { mediaDevices: {} },
     RTCPeerConnection: function () {},
 }, { filename: "index.js" });

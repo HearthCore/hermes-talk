@@ -188,7 +188,13 @@ byLabel(tree,'Message Hermes').props.onPaste({clipboardData:{files},
   preventDefault(){prevented++;}});
 assert.equal(prevented,1);assert.equal(added[0],files[0]);assert.equal(calls.length,0);
 tree=render();assert(text(tree).includes('diagram.png'));
+// Only the operation whose dispatch reaches a child can carry files; an owner
+// message keeps them local and says so instead of offering a send that refuses.
+assert.equal(button(tree,'Send').props.disabled,true);
+assert(text(tree).includes('Only a worker start can carry attachments'));
+tree=render({recipientOperation:'start_worker'});
 assert.equal(button(tree,'Send').props.disabled,false);
+assert(!text(tree).includes('Only a worker start can carry attachments'));
 byLabel(tree,'Typed message').props.onDrop({
   dataTransfer:{files:[],getData(){throw Error('URL read');}},
   preventDefault(){prevented++;},stopPropagation(){}});

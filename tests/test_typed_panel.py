@@ -360,3 +360,100 @@ assert.equal(transport.media.getAudioTracks()[0].enabled,false);
 props.setMuted(false);assert.equal(transport.media.getAudioTracks()[0].enabled,true);
 assert.equal(transports.length,1);assert.equal(transport.closed,false);
 """)
+
+
+def test_send_uploads_each_file_first_then_carries_its_references(source_bundle):
+    """Upload happens on Send, not while editing, and the dispatched body carries the
+    opaque references the plugin returned — never the bytes, never a host path."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval'],
+  attachments:true};
+const order=[];const base=fetchOverride;
+fetchOverride=(url,body,options)=>{
+  if(url.endsWith('/attachments/upload')) {
+    order.push('upload:'+body.filename);
+    return {ok:true,input_id:body.input_id,attachment_id:'att_'+body.filename,
+      sha256:'sha-'+body.filename,filename:body.filename,content_type:'text/plain',bytes:5};
+  }
+  if(url.endsWith('/text/input')) order.push('input');
+  return base(url,body,options);
+};
+const file=name=>({name,size:5,type:'text/plain',slice(){},
+  arrayBuffer:async()=>new TextEncoder().encode('bytes').buffer});
+let props=await boot();props.setRecipientOperation('start_worker');props=present();
+assert.equal(props.attachmentsSupported,true);
+assert.equal(props.addAttachments([file('a.txt'),file('b.txt')]),true);
+props.setTyped('read these');props=present();
+assert.equal(props.canSendTyped,true);
+assert.equal(order.length,0,'no upload may happen while the draft is edited');
+await props.sendTyped();props=present();
+assert.deepEqual(order,['upload:a.txt','upload:b.txt','input']);
+const input=requests.find(row=>row.url.endsWith('/text/input')).body;
+assert.equal(input.operation,'start_worker');
+assert.deepEqual(input.attachments,[{attachment_id:'att_a.txt',sha256:'sha-a.txt'},
+  {attachment_id:'att_b.txt',sha256:'sha-b.txt'}]);
+const uploads=requests.filter(row=>row.url.endsWith('/attachments/upload')).map(row=>row.body);
+assert.equal(uploads.length,2);
+assert(uploads.every(body=>body.input_id===input.input_id));
+assert.equal(uploads[0].bytes_base64,Buffer.from('bytes').toString('base64'));
+assert.equal(props.typed,'');assert.equal(props.attachments.length,0);
+assert.equal(transports.length,0);
+""")
+
+
+def test_a_failed_upload_keeps_the_draft_and_sends_nothing(source_bundle):
+    """A partial upload is not a send. The draft and its files survive, the retry
+    reuses the same input id, and /text/input is never called until every file is in."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval'],
+  attachments:true};
+let refuse=true;const base=fetchOverride;
+fetchOverride=(url,body,options)=>{
+  if(url.endsWith('/attachments/upload')) {
+    if(refuse) throw Error('the host refused this attachment');
+    return {ok:true,input_id:body.input_id,attachment_id:'att_one',sha256:'sha-one',
+      filename:body.filename,content_type:'text/plain',bytes:5};
+  }
+  return base(url,body,options);
+};
+const file={name:'a.txt',size:5,type:'text/plain',slice(){},
+  arrayBuffer:async()=>new TextEncoder().encode('bytes').buffer};
+let props=await boot();props.setRecipientOperation('start_worker');props=present();
+assert.equal(props.addAttachments([file]),true);props.setTyped('keep this');props=present();
+assert.equal(props.canSendTyped,true);
+assert.equal(await props.sendTyped(),false);props=present();
+assert.equal(props.typed,'keep this');assert.equal(props.attachments.length,1);
+assert(props.inputError,'the refusal must be visible');
+assert(!requests.some(row=>row.url.endsWith('/text/input')),'a failed upload sent nothing');
+refuse=false;await present().sendTyped();props=present();
+const input=requests.find(row=>row.url.endsWith('/text/input')).body;
+const uploads=requests.filter(row=>row.url.endsWith('/attachments/upload')).map(row=>row.body);
+assert.equal(uploads.length,2);
+assert.equal(uploads[0].input_id,uploads[1].input_id,'the retry keeps the original input id');
+assert.equal(input.input_id,uploads[0].input_id);
+assert.deepEqual(input.attachments,[{attachment_id:'att_one',sha256:'sha-one'}]);
+assert.equal(props.typed,'');assert.equal(props.attachments.length,0);
+""")
+
+
+def test_files_are_not_sendable_on_an_operation_that_cannot_carry_them(source_bundle):
+    """The adapter exists, but only a worker start reaches a child. An owner message
+    with files stays disabled and uploads nothing."""
+
+    execute(source_bundle, r"""
+capabilities={version:1,operations:['message','start_worker','steer','cancel','approval'],
+  attachments:true};
+const file={name:'a.txt',size:5,type:'text/plain',slice(){},
+  arrayBuffer:async()=>new TextEncoder().encode('bytes').buffer};
+let props=await boot();assert.equal(props.recipientOperation,'message');
+assert.equal(props.addAttachments([file]),true);props.setTyped('take this');props=present();
+assert.equal(props.attachmentsSupported,true);
+assert.equal(props.canSendTyped,false);await props.sendTyped();
+assert(!requests.some(row=>row.url.endsWith('/attachments/upload')));
+assert(!requests.some(row=>row.url.endsWith('/text/input')));
+assert.equal(present().typed,'take this');assert.equal(present().attachments.length,1);
+present().setRecipientOperation('start_worker');
+assert.equal(present().canSendTyped,true);
+""")
