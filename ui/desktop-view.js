@@ -147,7 +147,8 @@ export function DesktopTalkView(props) {
   })[recipientOperation] === true;
   const sendDisabled = !canSendTyped || !operationAvailable || recipientOperation === 'read' ||
     sending || busy || (!typed.trim() && !attachments.length) ||
-    (attachments.length > 0 && props.attachmentsSupported !== true);
+    (attachments.length > 0 &&
+      (props.attachmentsSupported !== true || recipientOperation !== 'start_worker'));
   const receiveFiles = files => {
     const selectedFiles = Array.from(files || []);
     if (selectedFiles.length && addAttachments && !sending) addAttachments(selectedFiles);
@@ -298,6 +299,10 @@ export function DesktopTalkView(props) {
       h(HermesSDK.Button, { type: 'submit', disabled: sendDisabled }, sending ? 'Sending…' : 'Send')),
     attachments.length > 0 && props.attachmentsSupported !== true &&
       h('p', { className: 'htd-muted' }, 'This recipient cannot receive attachments. Files remain local.'),
+    attachments.length > 0 && props.attachmentsSupported === true &&
+      recipientOperation !== 'start_worker' &&
+      h('p', { className: 'htd-muted' },
+        'Only a worker start can carry attachments. Files remain local.'),
     props.inputError && h('p', { className: 'htd-muted', role: 'alert' },
       'This input could not be sent. Your draft and attachments are retained.'),
     !operationAvailable && h('p', { className: 'htd-muted' }, 'This action is unavailable for the selected recipient.')),

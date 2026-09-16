@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import ClassVar
 from urllib.parse import quote, urlsplit
@@ -13,6 +14,17 @@ try:
     from .talk_passive import HistoryError, HistoryTransport, identifier, session_id
 except ImportError:  # pragma: no cover - flat plugin load
     from talk_passive import HistoryError, HistoryTransport, identifier, session_id
+
+
+#: The host's canonical input-attachment ingress. Fixed here, never taken from the
+#: capability document: ``_request`` chooses its suffix only from the methods in this
+#: file, and a published endpoint is verified against this constant instead.
+INPUT_ATTACHMENT_PATH = "/v1/input-attachments"
+#: Exactly what leaves this process for the browser. The host receipt carries no path,
+#: but projecting the allowed keys makes that a property of this file, not of the host.
+ATTACHMENT_RECEIPT_FIELDS = ("attachment_id", "filename", "content_type", "bytes", "sha256")
+_ATTACHMENT_ID = re.compile(r"att_[0-9a-f]{32}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 class DashboardTaskError(Exception):
@@ -57,6 +69,11 @@ class DashboardTaskError(Exception):
         "recipient_history_unsupported": "This host does not support recipient history reads.",
         "recipient_history_stale": "This history snapshot expired or changed; refresh the catalog.",
         "recipient_history_unavailable": "The recipient's native history is unavailable.",
+        "attachments_unsupported": "This host does not accept input attachments.",
+        "attachment_rejected": "The host refused this attachment; nothing was attached.",
+        "attachment_size_limit": "This attachment exceeds the host's published size limits.",
+        "attachment_reference_unknown": "That attachment was not uploaded for this input.",
+        "attachment_operation_unsupported": "This operation cannot carry attachments.",
     }
 
     def __init__(self, code: str, status: int = 409, *, retryable=False):
@@ -123,6 +140,16 @@ class TaskGateway:
                     code = code.get("code")
                 if status in {401, 403}:
                     raise DashboardTaskError("context_denied", 403)
+                if suffix == INPUT_ATTACHMENT_PATH:
+                    # The host's own refusal vocabulary is richer than this class; keep the
+                    # two distinctions an operator can act on (too large / refused) and let
+                    # everything else fall through to the ordinary gateway codes.
+                    if status == 413 or code == "attachment_size_limit":
+                        code = "attachment_size_limit"
+                    elif status in {400, 409} or (
+                        isinstance(code, str) and "attachment" in code
+                    ):
+                        code = "attachment_rejected"
                 if suffix.startswith("/v1/recipient-bridge/"):
                     if code in {
                         "history_target_expired", "history_cursor_expired",
@@ -212,6 +239,34 @@ class TaskGateway:
         except HistoryError:
             raise DashboardTaskError("gateway_response_invalid", 502, retryable=True) from None
         return response
+
+    def upload_attachment(self, body):
+        """One file to the host's own ingress; the reply is projected to opaque fields.
+
+        The gateway credential and the resolved host route stay in this process. The
+        receipt is re-checked against the bytes this call actually sent, so a host that
+        answers about a different file is a response error rather than a silent swap.
+        """
+        if set(body) != {
+            "session_id", "upload_id", "filename", "content_type", "content_base64",
+        }:
+            raise DashboardTaskError("invalid_event", 400)
+        data = self._request(
+            "POST", INPUT_ATTACHMENT_PATH, body=body, max_bytes=16384, timeout=60,
+        )
+        if (
+            data.get("state") != "stored"
+            or not isinstance(data.get("attachment_id"), str)
+            or not _ATTACHMENT_ID.fullmatch(data["attachment_id"])
+            or not isinstance(data.get("sha256"), str)
+            or not _SHA256.fullmatch(data["sha256"])
+            or type(data.get("bytes")) is not int
+            or data["bytes"] < 1
+            or not isinstance(data.get("filename"), str)
+            or not isinstance(data.get("content_type"), str)
+        ):
+            raise DashboardTaskError("gateway_response_invalid", 502)
+        return {key: data[key] for key in ATTACHMENT_RECEIPT_FIELDS}
 
     def run(self, run_id):
         data = self._request("GET", "/v1/runs/" + identifier(run_id))

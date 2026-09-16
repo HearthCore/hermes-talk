@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - plugin import without the dashboard ex
     JSONResponse = None
 
 try:
+    from . import talk_input_attachments
     from .talk_dashboard_gateway import DashboardTaskError
     from .talk_dashboard_store import bounded_text
     from .talk_dashboard_tasks import CHILD_TOOLS, codex_worker_available
@@ -30,6 +31,7 @@ try:
     from .talk_run_control import control_output
     from .talk_task_sources import TaskEventError
 except ImportError:  # pragma: no cover - flat plugin load
+    import talk_input_attachments
     from talk_dashboard_gateway import DashboardTaskError
     from talk_dashboard_store import bounded_text
     from talk_dashboard_tasks import CHILD_TOOLS, codex_worker_available
@@ -71,8 +73,23 @@ COORDINATOR_STATES = {
 }
 
 
-def descriptor():
-    return {"version": 1, "operations": list(OPERATIONS), "attachments": False}
+#: The only operation whose dispatch reaches a Hermes child, which is the only delivery
+#: the host advertises. Everything else refuses attachments rather than dropping them.
+ATTACHMENT_OPERATIONS = frozenset({"start_worker"})
+
+
+def descriptor(capabilities=None):
+    """The published input descriptor. ``attachments`` is live, never a constant.
+
+    The caller supplies the host capability document it just read; ``None`` (no host
+    read was possible) advertises false, which is what the panel's disabled-with-reason
+    path already handles.
+    """
+    return {
+        "version": 1,
+        "operations": list(OPERATIONS),
+        "attachments": talk_input_attachments.supported(capabilities),
+    }
 
 
 def _identifier(value):
@@ -94,13 +111,21 @@ def validate(body):
         key not in body for key in required
     ):
         raise DashboardTaskError("invalid_event", 400)
-    if body.get("attachments", []) != []:
-        raise DashboardTaskError("invalid_event", 400)
     fields = {
         "operation": operation,
         "input_id": _identifier(body.get("input_id")),
         "text": bounded_text(body.get("text"), maximum=16000),
     }
+    attachments = body.get("attachments", [])
+    if attachments:
+        # Shape first, then reachability: a malformed list is malformed on every
+        # operation, and only a well-formed reference earns the operation refusal.
+        references = talk_input_attachments.normalize_references(attachments)
+        if operation not in ATTACHMENT_OPERATIONS:
+            raise DashboardTaskError("attachment_operation_unsupported", 400)
+        fields["attachments"] = references
+    elif attachments != []:
+        raise DashboardTaskError("invalid_event", 400)
     if "recipient" in body:
         recipient = body["recipient"]
         if not isinstance(recipient, dict) or set(recipient) != set(IDENTITY_FIELDS):
@@ -242,11 +267,22 @@ def dispatch(tasks, request, body, fields):
         name = "send_agent_message"
         arguments = {"message": fields["text"], **fields["recipient"]}
     elif operation == "start_worker":
-        worker = fields.get("worker", "codex")
+        references = fields.get("attachments")
+        worker = fields.get("worker", "hermes" if references else "codex")
         bound.capabilities = tasks.capabilities(bound, refresh=True)
         if worker == "codex" and not codex_worker_available(bound.capabilities):
             raise DashboardTaskError("child_dispatch_unsupported", 409)
         name, arguments = "delegate_task", {"task": fields["text"], "worker": worker}
+        if references:
+            # Refuse before anything is posted: the host must still advertise the
+            # feature, and every reference must be pinned to THIS input under THIS
+            # binding. ``tool()`` re-checks the pins at the dispatch chokepoint.
+            talk_input_attachments.require_feature(bound.capabilities)
+            if worker != "hermes":
+                raise DashboardTaskError("attachment_operation_unsupported", 400)
+            arguments["attachments"] = tasks.verified_attachments(
+                bound, fields["input_id"], references
+            )
     else:
         name, arguments, run = _authorize_run(tasks, bound, fields)
     record = bound.stages.stage(bound.token, fields["input_id"], "typed", fields["text"])

@@ -61,6 +61,7 @@ import talk_config  # noqa: E402
 import talk_dashboard_tasks  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
+import talk_input_attachments  # noqa: E402
 import talk_live_config  # noqa: E402
 import talk_live_routes  # noqa: E402
 import talk_native_surface  # noqa: E402
@@ -313,6 +314,23 @@ def _status_problem(setting: str, exc: Exception) -> str:
     return f" ({setting} unusable; see the dashboard log, ref {reference})"
 
 
+def _input_capabilities(request) -> dict:
+    """The host capability document behind the input descriptor. Worker thread only.
+
+    ``/status`` answers before any task is joined, so there is no binding to read
+    through — this resolves the caller's own context and configured gateway, the same
+    pair ``join()`` uses, and pays for one bounded read. Every refusal (no task
+    context, no configured gateway, an unreachable or slow host) is the same answer:
+    an empty document, which advertises ``attachments: false``.
+    """
+
+    try:
+        context = TASKS.resolve_context(request)
+        return talk_dashboard_tasks.TaskGateway(TASKS.transport_factory(context)).capabilities()
+    except Exception:  # noqa: BLE001 - a capability probe never fails the status tile
+        return {}
+
+
 def _warm_agent_lane() -> str:
     """Resolve the agent lane, paying for a cold probe. Worker thread only."""
 
@@ -435,6 +453,8 @@ async def talk_status(request: Request) -> dict:
     """
 
     require_dashboard_auth(request)
+    # Read once, off the event loop, and hand the same document to both descriptors.
+    input_capabilities = await asyncio.to_thread(_input_capabilities, request)
     try:
         voice = talk_config.talk_voice()
     except talk_config.TalkConfigError as exc:
@@ -465,7 +485,7 @@ async def talk_status(request: Request) -> dict:
                            config.auth_mode == "subscription" else talk_live_config.API_VOICES),
             "version": talk_tools.plugin_version(),
             "taskContinuity": talk_dashboard_tasks.context_support(),
-            "textInput": talk_text_input.descriptor(),
+            "textInput": talk_text_input.descriptor(input_capabilities),
             "agentLoop": "canonical_task",
         }
     status = talk_auth.auth_status()
@@ -480,7 +500,7 @@ async def talk_status(request: Request) -> dict:
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
         "taskContinuity": talk_dashboard_tasks.context_support(),
-        "textInput": talk_text_input.descriptor(),
+        "textInput": talk_text_input.descriptor(input_capabilities),
         # Tri-state, not a bool: no plugin context is ever bound in the web
         # server process, so the only question that matters here is whether the
         # api_server lane can reach a real agent. This route is the page's
@@ -1157,6 +1177,11 @@ RECIPIENT_ROUTE_HANDLERS = talk_recipients.mount_recipient_routes(
     task_call=_task_call, service=TASKS.recipients,
 )
 
+ATTACHMENT_ROUTE_HANDLERS = talk_input_attachments.mount_attachment_routes(
+    router, require_auth=require_dashboard_auth, task_call=_task_call, tasks=TASKS,
+    http_exception=HTTPException,
+)
+
 TEXT_INPUT_ROUTE_HANDLERS = talk_text_input.mount_text_input_routes(
     router, require_auth=require_dashboard_auth, read_body=_json_body,
     task_call=_task_call, tasks=TASKS, coordinator=LIVE_SESSIONS.coordinator,
@@ -1183,6 +1208,7 @@ ROUTE_HANDLERS = (
     *LIVE_ROUTE_HANDLERS,
     *RECIPIENT_ROUTE_HANDLERS,
     *TEXT_INPUT_ROUTE_HANDLERS,
+    *ATTACHMENT_ROUTE_HANDLERS,
 )
 
 
