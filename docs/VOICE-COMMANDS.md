@@ -50,7 +50,7 @@ the actionable sentence.
 The full receipt-state vocabulary (`queued` / `landed` / `redirected` /
 `unconfirmed` / `missed` / `superseded`) and the artifacts behind each
 state live in the README's
-[redirecting-work section](../README.md#redirecting-work-thats-already-running)
+[redirecting-work section](BACKGROUND-WORK.md#redirecting-work-thats-already-running)
 — that prose is canonical; this card doesn't repeat it.
 
 ## Pausing the mic — and the way back
