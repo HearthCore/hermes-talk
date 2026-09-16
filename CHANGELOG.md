@@ -11,6 +11,28 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.20.1] — 2026-09-16
+
+### Added
+- Attachments on a worker start. `POST /attachments/upload` is an
+  authenticated, owner- and input-bound adapter over the host's attachment
+  ingress: it refuses unless the host advertises `features.input_attachments`
+  (read live), enforces the host's published limits, forwards through the
+  existing task gateway, and returns only an opaque
+  `{attachment_id, filename, content_type, bytes, sha256}`. `textInput.
+  attachments` on `/status` is sourced from the same live capability.
+  `/text/input` admits `{attachment_id, sha256}` references on `start_worker`
+  only, verified again at the single dispatch chokepoint against the same
+  owner, connection, generation and input; the other operations refuse with a
+  fixed code, matching the host's unsupported-delivery flags. In the panel, a
+  Send with files uploads first and then sends with the references frozen
+  into the captured send; an upload failure keeps the draft and sends
+  nothing. (#160)
+
+### Fixed
+- The browser-flow route test awaited the delivery emit before reading the
+  event cursor, closing a race that flaked on slow Windows runners. (#160)
+
 ## [0.20.0] — 2026-09-16
 
 ### Added
