@@ -139,7 +139,13 @@ def test_http_browser_flow_keeps_credentials_private_replays_events_and_closes_o
         async with application(environment) as (client, fixture):
             body = await create(client, fixture)
             await delegate(fixture)
-            await wait_for(lambda: bool(fixture.browser.session.commands))
+            # The delivery emit lands AFTER session.send returns, so waiting on the
+            # sent commands leaves the last event in flight: the first poll's cursor
+            # and the repeat below would then disagree. Wait for the event itself.
+            binding = fixture.registry.bindings[body["binding_id"]]
+            await wait_for(lambda: any(
+                event["type"] == "delivery" for event, _ in binding.events
+            ))
             first = await client.post("/live/events", json={**body, "after": 0})
             assert first.status_code == 200, first.text
             response = first.json()
