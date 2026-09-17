@@ -6,16 +6,152 @@ const DESKTOP_API = '/api/plugins/hermes-talk';
 const h = React.createElement;
 let desktopContext = null;
 const desktopOpeners = new Set();
+const INCOMPLETE_TALK_CONTRACT = 'This Hermes Desktop build reports an incomplete Talk contract.';
+const STOCK_SCOPE_MOVED = 'Talk follows the active profile on this Hermes Desktop. ' +
+  "Switch to this conversation's profile, then try again.";
 
 function ownerKey(owner) {
   return JSON.stringify([owner?.connectionId, owner?.profile,
     owner?.sessionId ?? null, owner?.storedSessionId ?? null]);
 }
 
+// The stock lane reads the focused conversation from the host state atoms and
+// owns its own lifetime. The Talk-enabled build supplies a controller instead.
+const STOCK_STATE_ATOMS = ['focusedSessionOwner', 'focusedSessionId', 'focusedStoredSessionId',
+  'focusedSessionProfile', 'connectionId', 'profile'];
+
+// A local Hermes reports no connection id; 'local' is its documented name. A
+// profile has no such default, so an absent one stays absent.
+function stockConnectionValue(value) {
+  return typeof value === 'string' && value ? value : 'local';
+}
+
+function stockProfileValue(value) {
+  return typeof value === 'string' && value ? value : null;
+}
+
+function sameStockProfile(left, right) {
+  return (left ?? null) === (right ?? null);
+}
+
+function readHostScope() {
+  const state = HermesSDK.host?.state;
+  return {
+    connectionId: stockConnectionValue(state?.connectionId?.get?.()),
+    profile: stockProfileValue(state?.profile?.get?.()),
+  };
+}
+
+function readFocusedSnapshot() {
+  const state = HermesSDK.host?.state;
+  const focused = state?.focusedSessionOwner?.get?.() || null;
+  return {
+    connectionId: stockConnectionValue(focused?.connectionId),
+    profile: stockProfileValue(focused?.profile || state?.focusedSessionProfile?.get?.()),
+    sessionId: state?.focusedSessionId?.get?.() || null,
+    storedSessionId: state?.focusedStoredSessionId?.get?.() || null,
+  };
+}
+
+export function hasTalkHostCapabilities(controller) {
+  return Boolean(controller) && controller.capabilities?.microphoneLease === 1 &&
+    controller.capabilities?.pinnedRest === 1 && controller.capabilities?.prepareSession === 1 &&
+    typeof controller.acquire === 'function' && typeof controller.prepareSession === 'function';
+}
+
+async function prepareStockSession(snapshot) {
+  // A stock draft carries no runtime or stored id until its first prompt.
+  if (!snapshot?.sessionId || !snapshot.storedSessionId) {
+    throw new Error('Send one message in this conversation first, then Connect. ' +
+      'Hermes Desktop saves a conversation on its first message.');
+  }
+  const ambient = readHostScope();
+  if (ambient.connectionId !== snapshot.connectionId ||
+      !sameStockProfile(ambient.profile, snapshot.profile)) {
+    throw new Error(STOCK_SCOPE_MOVED);
+  }
+  // Read-only: a title request without a title returns the durable session key.
+  const titled = await HermesSDK.host?.request?.('session.title', { session_id: snapshot.sessionId });
+  if (titled?.session_key !== snapshot.storedSessionId) {
+    throw new Error('The Hermes conversation changed. Reopen Talk in the selected conversation.');
+  }
+  return { ...snapshot };
+}
+
+function createStockTalkController(owner) {
+  const lifetime = new AbortController();
+  return {
+    capabilities: { lane: 'stock', microphoneLease: 0, pinnedRest: 0, prepareSession: 1 },
+    owner,
+    signal: lifetime.signal,
+    stop() { lifetime.abort(); },
+    async acquire() {
+      // Stock Desktop coordinates no microphone lease; the shared UI opens
+      // getUserMedia itself and reports its own refusal.
+      try { await window.hermesDesktop?.requestMicrophoneAccess?.(); }
+      catch (_) { /* an unavailable prompt is not a refusal of the lease */ }
+      return { signal: lifetime.signal, release() {} };
+    },
+    prepareSession() { return prepareStockSession(owner); },
+  };
+}
+
+function readStockSnapshot() {
+  return { owner: readFocusedSnapshot(), ambient: readHostScope() };
+}
+
+function stockSnapshotKey(snapshot) {
+  return ownerKey(snapshot.owner) + '|' +
+    JSON.stringify([snapshot.ambient.connectionId, snapshot.ambient.profile]);
+}
+
+function subscribeStockState(handler) {
+  const state = HermesSDK.host?.state;
+  const stops = [];
+  for (const name of STOCK_STATE_ATOMS) {
+    const atom = state?.[name];
+    const subscribe = atom?.subscribe || atom?.listen;
+    if (typeof subscribe !== 'function') continue;
+    try {
+      const stop = subscribe.call(atom, handler);
+      if (typeof stop === 'function') stops.push(stop);
+    } catch (_) { /* an atom that refuses a listener cannot report drift */ }
+  }
+  return () => stops.forEach(stop => { try { stop(); } catch (_) { /* already gone */ } });
+}
+
+function useStockVoiceController() {
+  const [snapshot, setSnapshot] = React.useState(null);
+  const active = React.useRef(null);
+  React.useEffect(() => {
+    // One read per notification keeps the six atoms from tearing against each other.
+    const apply = () => setSnapshot(previous => {
+      const next = readStockSnapshot();
+      return previous && stockSnapshotKey(previous) === stockSnapshotKey(next) ? previous : next;
+    });
+    apply();
+    return subscribeStockState(apply);
+  }, []);
+  const current = snapshot || readStockSnapshot();
+  const key = stockSnapshotKey(current);
+  if (!active.current || active.current.key !== key) {
+    active.current = { key, controller: createStockTalkController(current.owner) };
+  }
+  const entry = active.current;
+  React.useEffect(() => () => {
+    entry.controller.stop();
+    // Drop the cache too, so a remount rebuilds instead of handing back a
+    // controller whose lifetime this cleanup just aborted.
+    if (active.current === entry) active.current = null;
+  }, [entry.controller]);
+  return entry.controller;
+}
+
 export function desktopAvailability(controller) {
-  if (!controller || controller.capabilities?.microphoneLease !== 1 ||
-      controller.capabilities?.pinnedRest !== 1 || controller.capabilities?.prepareSession !== 1) {
-    return 'Update Hermes Desktop to use Talk in this conversation.';
+  const stock = controller?.capabilities?.lane === 'stock';
+  if (!controller || (!stock && (controller.capabilities?.microphoneLease !== 1 ||
+      controller.capabilities?.pinnedRest !== 1 || controller.capabilities?.prepareSession !== 1))) {
+    return INCOMPLETE_TALK_CONTRACT;
   }
   if (typeof controller.acquire !== 'function' ||
       typeof controller.owner?.connectionId !== 'string' || !controller.owner.connectionId ||
@@ -47,7 +183,7 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         throw new Error('The Hermes conversation changed. Reopen Talk in the selected conversation.');
       }
       if (current.capabilities?.prepareSession !== 1 || typeof current.prepareSession !== 'function') {
-        throw new Error('Update Hermes Desktop to start Talk in this conversation.');
+        throw new Error(INCOMPLETE_TALK_CONTRACT);
       }
       let prepared = null;
       onPreparing(true);
@@ -118,6 +254,15 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
       if (options.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
       const suffix = path.slice(DESKTOP_API.length);
       const headers = new Headers(options.headers || {});
+      if (currentController()?.capabilities?.lane === 'stock') {
+        // Stock plugin REST follows the ambient connection and profile, so a moved
+        // scope would silently address another gateway.
+        const ambient = readHostScope();
+        if (ambient.connectionId !== scope.connectionId ||
+            !sameStockProfile(ambient.profile, scope.profile)) {
+          throw new Error(STOCK_SCOPE_MOVED);
+        }
+      }
       // Keep in-flight receipts on their captured owner, including a late /close.
       // The shared UI's generation checks retire results after navigation.
       try {
@@ -132,7 +277,10 @@ export function createDesktopTalkSDK(context, controller, onPreparing = () => {}
         const prefix = "Error invoking remote method 'hermes:api': Error: ";
         const normalized = typeof error?.message === 'string' && error.message.startsWith(prefix)
           ? new Error(error.message.slice(prefix.length)) : error;
-        if (/^(?:401|403)\b/.test(normalized?.message || '')) sdk.stopHost();
+        // A stock host cannot present TALK_DASHBOARD_TOKEN, so a refusal there is a
+        // notice to show, not a lost host session to stop.
+        if (/^(?:401|403)\b/.test(normalized?.message || '') &&
+            currentController()?.capabilities?.lane !== 'stock') sdk.stopHost();
         throw normalized;
       }
     },
@@ -171,7 +319,8 @@ function DesktopTalkPresentation(props) {
         overflowY: 'auto', padding: '1rem' },
       onSubmit: event => event.stopPropagation(),
     }, h('p', { role: 'status', style: { fontSize: '.75rem', marginBottom: '.75rem' } },
-      'Composer mode · update Hermes Desktop for a persistent floating Talk window.'),
+      'Composer mode · The floating Talk window needs the Talk-enabled Hermes Desktop build ' +
+      '(docs/DESKTOP.md).'),
     h(DesktopTalkView, props)));
 }
 
@@ -347,28 +496,36 @@ function DesktopTalkPanel({ context, controller, onPreparing, presentationProps 
 }
 
 export function openFocusedTalk() {
-  const state = HermesSDK.host?.state;
-  const focused = state?.focusedSessionOwner?.get();
-  const stored = state?.focusedStoredSessionId?.get() || null;
-  const runtime = state?.focusedSessionId?.get() || null;
-  const matches = [...desktopOpeners].filter(entry => {
+  // One reader for both sides, so the title bar matches on the same normalised
+  // owner the stock lane hands its panel.
+  const focused = readFocusedSnapshot();
+  const matches = !focused.sessionId ? [] : [...desktopOpeners].filter(entry => {
     const candidate = entry.owner();
-    return focused && candidate?.connectionId === focused.connectionId &&
-      candidate?.profile === focused.profile && (candidate?.storedSessionId || null) === stored &&
-      (candidate?.sessionId || null) === runtime;
+    return candidate?.connectionId === focused.connectionId &&
+      sameStockProfile(candidate?.profile, focused.profile) &&
+      (candidate?.storedSessionId || null) === focused.storedSessionId &&
+      (candidate?.sessionId || null) === focused.sessionId;
   });
-  if (matches.length === 1) matches[0].open();
+  // Stock composer actions all report the same focused conversation, so several
+  // matches name one conversation rather than an ambiguous choice.
+  const stockOnly = matches.length > 1 && matches.every(entry => entry.lane?.() === 'stock');
+  if (matches.length === 1 || stockOnly) matches[0].open();
   else HermesSDK.host?.notify('Open a connected conversation, then choose Talk beside its message box.');
 }
 
 function DesktopTalkAction() {
   if (persistentTalkAvailable(desktopContext)) return h(DesktopTalkLauncher);
   const useController = HermesSDK.useComposerVoiceController || (() => null);
-  const controller = useController();
+  const hostController = useController();
+  const stockController = useStockVoiceController();
+  const controller = hasTalkHostCapabilities(hostController) ? hostController : stockController;
+  const lane = controller.capabilities?.lane === 'stock' ? 'stock' : 'host';
   const [attached, setAttached] = React.useState(null);
   const [popoverOpen, setPopoverOpen] = React.useState(false);
   const controllerRef = React.useRef(controller);
   controllerRef.current = controller;
+  const laneRef = React.useRef(lane);
+  laneRef.current = lane;
   const preparingRef = React.useRef(false);
   const currentOwner = ownerKey(controller?.owner);
   const unavailable = desktopAvailability(controller);
@@ -385,7 +542,8 @@ function DesktopTalkAction() {
     else setPopoverOpen(false);
   };
   React.useEffect(() => {
-    const entry = { owner: () => controllerRef.current?.owner, open: openPanel };
+    const entry = { owner: () => controllerRef.current?.owner, lane: () => laneRef.current,
+      open: openPanel };
     desktopOpeners.add(entry);
     return () => desktopOpeners.delete(entry);
   }, []);
@@ -420,7 +578,7 @@ function DesktopTalkAction() {
       }, h('p', { role: 'status' }, unavailable || 'The Talk plugin is not ready.'))
       : h(DesktopTalkPanel, {
         key: attached.initialKey, context: desktopContext, controller, onPreparing,
-        presentationProps: { popoverOpen, onPopoverOpenChange },
+        presentationProps: { popoverOpen, onPopoverOpenChange, lane },
       }))));
 }
 
