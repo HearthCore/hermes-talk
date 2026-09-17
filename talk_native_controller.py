@@ -13,9 +13,11 @@ from dataclasses import dataclass, field
 
 try:
     from . import talk_realtime as rt
+    from .talk_audio import PlaybackProgress
     from .talk_native_api import NativeTaskError
 except ImportError:  # pragma: no cover - flat plugin load
     import talk_realtime as rt
+    from talk_audio import PlaybackProgress
     from talk_native_api import NativeTaskError
 
 
@@ -86,6 +88,7 @@ class NativeTaskController:
         self.authorize_surface = authorize_surface
         self.clock = clock
         self.closed = False
+        self.service_paused = False
         self.inputs, self.requests, self.responses = {}, {}, {}
         self.committed = set()
         self.completed = deque()
@@ -115,10 +118,14 @@ class NativeTaskController:
 
     def guard(self):
         if not self.current:
-            raise NativeTaskError("Native task connection is no longer current")
+            raise NativeTaskError(
+                "Native task connection is no longer current", category="stale", superseded=True
+            )
         if self.authorize_surface is not None and self.authorize_surface() is not True:
             self.audio.drain_playback()
-            raise NativeTaskError("Discord speaker or room audience authorization changed")
+            raise NativeTaskError(
+                "Discord speaker or room audience authorization changed", category="authorization"
+            )
 
     def notice(self, value):
         if self.current and self.on_notice is not None:
@@ -261,7 +268,12 @@ class NativeTaskController:
             if (
                 not event.response_id
                 or meta != presentation["metadata"]
-                or presentation.get("response_id")
+                or presentation.get("response_id") not in {None, event.response_id}
+                or event.response_id in self.responses
+                or any(
+                    value is not presentation and value.get("response_id") == event.response_id
+                    for value in self.presentations.values()
+                )
             ):
                 raise NativeTaskError("Task summary response identity is ambiguous")
             presentation["response_id"] = event.response_id
@@ -347,9 +359,15 @@ class NativeTaskController:
     async def _done(self, event):
         presentation = self._presentation_for(event.response_id)
         if presentation is not None:
-            presentation["retired"] = True
-            if self.presentation is presentation:
-                self.presentation = None
+            if presentation["retired"]:
+                return
+            presentation["generation_done"] = event.status == "completed"
+            if event.status != "completed":
+                await self._retire_presentation(
+                    presentation, "interrupted" if event.status == "cancelled" else "unknown"
+                )
+            else:
+                await self._observe_presentation(presentation)
             return
         response = self.responses.get(event.response_id)
         if response is None:
@@ -531,8 +549,12 @@ class NativeTaskController:
         elif isinstance(event, rt.ResponseFinished):
             await self._done(event)
         elif isinstance(event, rt.OutputAudio):
+            if self.service_paused:
+                return
             presentation = self._presentation_for(event.response_id)
             response = self.responses.get(event.response_id)
+            if self.presentation is not None and presentation is not self.presentation:
+                return
             if (presentation is not None and not presentation["retired"]) or (
                 response is not None
                 and not response.request.row.incomplete
@@ -547,6 +569,14 @@ class NativeTaskController:
                 if set(event.call_ids).intersection(response.calls):
                     await self.incomplete(response.request.row, "cancelled")
         elif isinstance(event, rt.ProviderFailure):
+            presentation = self.presentations.get(
+                event.response_metadata.get("talk_presentation_id")
+            )
+            if (
+                presentation is not None
+                and dict(event.response_metadata) == presentation["metadata"]
+            ):
+                await self._retire_presentation(presentation, "unknown")
             request = self.requests.get(event.response_metadata.get("talk_request_id"))
             if request is not None and dict(event.response_metadata) == request.metadata:
                 await self.incomplete(request.row, "response_failed")
@@ -559,10 +589,11 @@ class NativeTaskController:
         self.guard()
         commands = []
         if self.presentation is not None:
-            self.presentation["retired"] = True
-            if self.presentation.get("response_id"):
-                commands.append(rt.CancelResponse(self.presentation["response_id"]))
-            self.presentation = None
+            presentation = self.presentation
+            if presentation.get("response_id"):
+                commands.append(rt.CancelResponse(presentation["response_id"]))
+            await self._observe_presentation(presentation, finishing=False)
+            await self._retire_presentation(presentation, "interrupted")
         if not presentation_only:
             for response in self.responses.values():
                 if not response.finished and not response.request.row.incomplete:
@@ -581,6 +612,8 @@ class NativeTaskController:
 
     async def send_audio(self, pcm):
         self.guard()
+        if self.service_paused:
+            return
         if type(pcm) is not bytes or not pcm or len(pcm) % 2:
             raise NativeTaskError("Native microphone input must be PCM16 mono")
         self.last_input_sample = self.clock()
@@ -613,6 +646,8 @@ class NativeTaskController:
 
     async def tick(self):
         self.guard()
+        if self.presentation is not None:
+            await self._observe_presentation(self.presentation)
         now = self.clock()
         if (
             self.operator_speaking
@@ -636,7 +671,11 @@ class NativeTaskController:
             if not response.finished and now - response.created_at >= 45:
                 await self.incomplete(response.request.row, "missing_tool_calls")
         if self.presentation and now - self.presentation["created_at"] >= 30:
-            await self.interrupt(presentation_only=True)
+            presentation = self.presentation
+            await self._retire_presentation(presentation, "unknown")
+            self.audio.drain_playback()
+            if presentation.get("response_id"):
+                await self.send([rt.CancelResponse(presentation["response_id"])])
 
     async def result(self, run_id):
         self.guard()
@@ -655,6 +694,7 @@ class NativeTaskController:
         async with self.refresh_lock:
             state = await self.request("/state")
             self.last_state = state
+            self.service_paused = False
             await self._refresh_history(state)
             if self.on_state is not None:
                 self.on_state(state)
@@ -740,12 +780,63 @@ class NativeTaskController:
         await self.send(commands)
         self.history_item = item_id
 
-    async def _speak(self, candidate):
+    async def _speech_receipt(self, receipt, state, *, response_id=None):
+        result = await self.request(
+            "/speech/receipt",
+            {**receipt, "state": state, **({"response_id": response_id} if response_id else {})},
+        )
+        if result.get("ok") is not True:
+            raise NativeTaskError("Task summary receipt was not acknowledged")
+
+    async def _retire_presentation(self, presentation, state):
+        if presentation["retired"]:
+            return
+        presentation["retired"] = True
+        if self.presentation is presentation:
+            self.presentation = None
+        await self._speech_receipt(
+            presentation["receipt"], state, response_id=presentation.get("response_id")
+        )
+
+    async def _observe_presentation(self, presentation, *, finishing=True):
+        if presentation["retired"] or not presentation["context_submitted"]:
+            return
+        baseline = presentation["playback_baseline"]
+        progress = getattr(self.audio, "playback_progress", None)
+        if not isinstance(baseline, PlaybackProgress) or not isinstance(progress, PlaybackProgress):
+            if presentation["generation_done"]:
+                await self._retire_presentation(presentation, "unknown")
+            return
+        response_id = presentation.get("response_id")
+        if (
+            response_id and progress.consumed_bytes > baseline.consumed_bytes
+            and not presentation["playback_started"]
+        ):
+            await self._speech_receipt(
+                presentation["receipt"], "playback_started", response_id=response_id
+            )
+            presentation["playback_started"] = True
+        if progress.discarded_bytes != baseline.discarded_bytes:
+            await self._retire_presentation(presentation, "unknown")
+        elif finishing and presentation["generation_done"] and not progress.pending:
+            await self._retire_presentation(
+                presentation, "playback_finished" if presentation["playback_started"] else "unknown"
+            )
+
+    async def _speak(self, candidate, *, replay=False):
+        baseline = getattr(self.audio, "playback_progress", None)
         speech = await self.request(
-            "/speech", {"event_id": candidate["event_id"], "timing": self.timing()}
+            "/speech",
+            {
+                "event_id": candidate["event_id"],
+                "timing": self.timing(),
+                "presentation_protocol": 1,
+                "playback_supported": isinstance(baseline, PlaybackProgress),
+                "replay": replay,
+            },
         )
         if speech.get("speak") is not True:
-            return
+            return speech
         response = speech.get("response") or {}
         metadata = response.get("metadata") or {}
         receipt = {"event_id": speech.get("event_id"), "attempt_id": speech.get("attempt_id")}
@@ -759,26 +850,52 @@ class NativeTaskController:
         ):
             raise NativeTaskError("Task summary response is not isolated")
         if any(value for key, value in self.timing().items() if key != "sequence"):
-            await self.request("/speech/receipt", {**receipt, "state": "deferred"})
-            return
+            await self._speech_receipt(receipt, "deferred")
+            return {**speech, "speak": False}
         if speech.get("result") is not None and self.on_result is not None:
             self.on_result(speech["result"])
-        presentation = {"metadata": dict(metadata), "created_at": self.clock(), "retired": False}
-        self.presentation = presentation
-        self.presentations[receipt["attempt_id"]] = presentation
-        await self.send(
-            [
-                rt.StartResponse(
-                    metadata=metadata,
-                    allow_tools=False,
-                    input=tuple(response["input"]),
-                    conversation="none",
-                    instructions=response.get("instructions"),
-                    max_output_tokens=response.get("max_output_tokens"),
+        async with self.send_lock:
+            self.guard()
+            if any(value for key, value in self.timing().items() if key != "sequence"):
+                await self._speech_receipt(receipt, "deferred")
+                return {**speech, "speak": False}
+            presentation = {
+                "metadata": dict(metadata), "receipt": receipt, "created_at": self.clock(),
+                "retired": False, "context_submitted": False, "generation_done": False,
+                "playback_started": False,
+                "playback_baseline": getattr(self.audio, "playback_progress", None),
+            }
+            await self._speech_receipt(receipt, "submitting")
+            try:
+                self.guard()
+                if any(value for key, value in self.timing().items() if key != "sequence"):
+                    await self._retire_presentation(presentation, "unknown")
+                    return {**speech, "speak": False}
+                presentation["playback_baseline"] = getattr(self.audio, "playback_progress", None)
+                self.presentation = presentation
+                self.presentations[receipt["attempt_id"]] = presentation
+                await self.session.send(
+                    (
+                        rt.StartResponse(
+                            metadata=metadata,
+                            allow_tools=False,
+                            input=tuple(response["input"]),
+                            conversation="none",
+                            instructions=response.get("instructions"),
+                            max_output_tokens=response.get("max_output_tokens"),
+                        ),
+                    )
                 )
-            ]
-        )
-        await self.request("/speech/receipt", {**receipt, "state": "sent"})
+                self.guard()
+                await self._speech_receipt(receipt, "context_submitted")
+                presentation["context_submitted"] = True
+                await self._observe_presentation(presentation)
+            except BaseException:
+                with suppress(NativeTaskError):
+                    if self.current:
+                        await self._retire_presentation(presentation, "unknown")
+                raise
+        return speech
 
     async def command(self, line):
         self.guard()
@@ -820,6 +937,8 @@ class NativeTaskController:
             return await self.refresh(announce=False)
         if name == "/result" and len(args) == 1 and args[0].isascii() and args[0].isdigit():
             return await self.result(int(args[0]))
+        if name == "/replay" and len(args) == 1:
+            return await self._speak({"event_id": args[0]}, replay=True)
         if (
             name == "/preference"
             and len(args) == 1
@@ -838,6 +957,11 @@ class NativeTaskController:
     async def close(self):
         if self.closed:
             return
+        if self.current and self.presentation is not None:
+            with suppress(NativeTaskError):
+                await self._observe_presentation(self.presentation, finishing=False)
+                if self.presentation is not None:
+                    await self._retire_presentation(self.presentation, "unknown")
         self.closed = True
         self.audio.drain_playback()
         current = asyncio.current_task()

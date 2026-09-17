@@ -268,6 +268,7 @@ class _RealtimeSource:
         self._carry_lock = threading.Lock()
         self._served_lock = threading.Lock()
         self._frames_served = 0
+        self._discarded_bytes = 0
         self.authorize_playback = None
 
     @property
@@ -284,12 +285,7 @@ class _RealtimeSource:
 
     def read(self) -> bytes:
         if self.authorize_playback is not None and self.authorize_playback() is not True:
-            self.cleanup()
-            while True:
-                try:
-                    self._frames.get_nowait()
-                except queue.Empty:
-                    break
+            self.discard_pending()
             return SILENCE_FRAME
         with self._carry_lock:
             while len(self._carry) < DISCORD_FRAME_BYTES:
@@ -312,7 +308,26 @@ class _RealtimeSource:
 
     def cleanup(self) -> None:
         with self._carry_lock:
+            self._discarded_bytes += len(self._carry)
             self._carry.clear()
+
+    def discard_pending(self) -> None:
+        with self._carry_lock:
+            self._discarded_bytes += len(self._carry)
+            self._carry.clear()
+            while True:
+                try:
+                    self._discarded_bytes += len(self._frames.get_nowait())
+                except queue.Empty:
+                    break
+
+    def playback_progress(self) -> talk_audio.PlaybackProgress:
+        with self._carry_lock:
+            return talk_audio.PlaybackProgress(
+                self.frames_served * DISCORD_FRAME_BYTES,
+                self._discarded_bytes,
+                bool(self._carry) or not self._frames.empty(),
+            )
 
 
 #: Concrete source classes, cached per host base class.
@@ -394,6 +409,7 @@ class DiscordAudio:
         self._listener_lock = threading.RLock()
         self._listener_condition = threading.Condition(self._listener_lock)
         self._played_baseline = 0
+        self._discarded_playback_bytes = 0
         self._carry_sample: int | None = None
         self._capture_remainder: dict[Any, bytes] = {}
         #: SSRCs already warned about (E2EE audio withheld, speaker unknown).
@@ -1301,6 +1317,8 @@ class DiscordAudio:
         try:
             self._outbound.put_nowait(converted)
         except queue.Full:
+            with self._lock:
+                self._discarded_playback_bytes += len(converted)
             _log.debug("discord playback queue full — dropping a chunk")
 
     def drain_playback(self) -> None:
@@ -1309,14 +1327,15 @@ class DiscordAudio:
         with self._lock:
             source = self._source
             self._played_baseline = source.frames_served if source is not None else 0
-        while True:
-            try:
-                self._outbound.get_nowait()
-            except queue.Empty:
-                break
-        source = self._source
         if source is not None:
-            source.cleanup()
+            source.discard_pending()
+        else:
+            with self._lock:
+                while True:
+                    try:
+                        self._discarded_playback_bytes += len(self._outbound.get_nowait())
+                    except queue.Empty:
+                        break
         self._carry_sample = None
 
     @property
@@ -1341,8 +1360,22 @@ class DiscordAudio:
         return source is not None and source.carrying
 
     @property
+    def playback_progress(self) -> talk_audio.PlaybackProgress | None:
+        source = self._source
+        if source is None or self._capture_only:
+            return None
+        progress = source.playback_progress()
+        with self._lock:
+            discarded = self._discarded_playback_bytes
+        return talk_audio.PlaybackProgress(
+            progress.consumed_bytes,
+            progress.discarded_bytes + discarded,
+            progress.pending,
+        )
+
+    @property
     def played_ms(self) -> int:
-        """Milliseconds the channel has actually HEARD since the last reset.
+        """Milliseconds consumed by the local player since the last reset.
 
         Counted from frames the host's player thread pulled — never from
         what we queued. The model streams far faster than realtime, so

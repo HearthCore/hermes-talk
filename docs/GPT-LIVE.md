@@ -1,14 +1,15 @@
 # GPT-Live and task workers
 
-Hermes Talk 0.18.0 connects GPT-Live conversation to a selected Hermes task.
+Hermes Talk 0.19.0 connects GPT-Live conversation to a selected Hermes task.
 That task can delegate to Hermes or an explicitly configured Codex worker while
 you keep talking. Voice, typed input, worker receipts and results share task
 ownership. Closing or switching voice does not cancel accepted background work.
 
-**Operator microphone acceptance is still pending for subscription and API on
-all three surfaces.** Provider-only connection probes and offline regressions
-are narrower evidence. Use the acceptance checklist below before treating an
-installation as complete.
+Use the acceptance checklist below to verify your installation. A successful
+provider connection checks authentication and transport; an operator conversation
+checks microphone input, spoken replies and task delivery. Existing application
+recipients and recovery behavior are described in
+[recipient routing](recipient-routing.md).
 
 ## Prerequisites
 
@@ -29,6 +30,7 @@ installation as complete.
 | Surface | Subscription audio | API audio | Dependencies |
 |---|---|---|---|
 | Dashboard | Browser WebRTC | Browser WebRTC | Base package on server; browser microphone permission |
+| Desktop Talk action | Renderer WebRTC | Renderer WebRTC | Matching microphone-ownership and pinned-routing host; [Desktop setup](DESKTOP.md) |
 | Terminal | `aiortc` WebRTC | `aiohttp` WebSocket | `[audio,live]` for subscription; `[audio]` for API |
 | Discord | `aiortc` WebRTC | `aiohttp` WebSocket | `[live]` for subscription, host Discord voice dependencies |
 

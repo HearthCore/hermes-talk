@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -15,6 +16,12 @@ try:
     from .talk_passive import HistoryError, HistoryMessage, HistoryOwner, dialogue_messages, digest
 except ImportError:  # pragma: no cover - flat Hermes plugin load
     from talk_passive import HistoryError, HistoryMessage, HistoryOwner, dialogue_messages, digest
+
+# How long a connection waits for a lock before the outbox reports itself unavailable.
+# A bound on contention, not a deadline for work: no transaction spans a network request.
+_BUSY_TIMEOUT_S = 10.0
+# The constructor keeps the historical short wait; it runs on hot paths (attach, delegate).
+_CONSTRUCTOR_TIMEOUT_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +71,10 @@ class HistoryOutbox:
         self._profile = profile
         self._max_events, self._max_bytes, self._ttl_s = max_events, max_bytes, ttl_s
         self._clock = clock
+        self._schema_lock = threading.RLock()
+        self._schemas = set()
+        self._last_prune = float("-inf")
+        self._maintenance_interval = min(60, ttl_s / 4)
         self._path = profile_home / "state" / "talk-history-outbox.sqlite3"
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -71,7 +82,28 @@ class HistoryOutbox:
             self._path.chmod(0o600)
         except OSError:
             raise HistoryError("outbox_unavailable") from None
-        with self._db(prune=False) as db:
+        # Write-ahead logging, set once and persisted in the file: readers never wait on a
+        # committing writer and a writer never waits on readers. In the default rollback
+        # journal a steady stream of commits (a liveness probe, a lease renewal) starves
+        # every concurrent read on a slow disk until the busy timeout turns that starvation
+        # into "storage broken". Must run outside a transaction, hence its own connection.
+        # Best effort with a short lock wait, and the schema transaction below keeps the
+        # same short wait: this constructor runs per dashboard attach and per Codex
+        # delegation, so it fails in 2 s behind a held writer as it always did, while
+        # ordinary reads and writes get the longer busy bound. A filesystem that refuses
+        # WAL keeps rollback mode and that bound still applies.
+        db = None
+        try:
+            db = sqlite3.connect(self._path, timeout=_CONSTRUCTOR_TIMEOUT_S)
+            db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
+        except OSError:
+            raise HistoryError("outbox_unavailable") from None
+        finally:
+            if db is not None:
+                db.close()
+        with self._db(prune=False, timeout=_CONSTRUCTOR_TIMEOUT_S) as db:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS metadata "
                 "(profile TEXT NOT NULL, next_generation INTEGER NOT NULL)"
@@ -93,18 +125,21 @@ class HistoryOutbox:
                 code TEXT NOT NULL DEFAULT '')""")
 
     @contextmanager
-    def _db(self, *, prune: bool = True) -> Iterator[sqlite3.Connection]:
+    def _db(
+        self, *, prune: bool = False, write: bool = True, timeout: float = _BUSY_TIMEOUT_S
+    ) -> Iterator[sqlite3.Connection]:
         db = None
         try:
-            db = sqlite3.connect(self._path, timeout=2)
+            db = sqlite3.connect(self._path, timeout=timeout)
             db.row_factory = sqlite3.Row
             db.execute("PRAGMA secure_delete=ON")
             db.execute("PRAGMA foreign_keys=ON")
-            db.execute("BEGIN IMMEDIATE")
-            if prune:
+            db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            if prune and self._clock() - self._last_prune >= self._maintenance_interval:
                 # Retention cleanup must survive a subsequent admission/read refusal.
                 self._prune(db)
                 db.commit()
+                self._last_prune = self._clock()
                 db.execute("BEGIN IMMEDIATE")
             yield db
             db.commit()
@@ -113,6 +148,14 @@ class HistoryOutbox:
         finally:
             if db is not None:
                 db.close()
+
+    def ensure_schema(self, name, initialize):
+        """Initialize each derived schema once per outbox, after a committed transaction."""
+        with self._schema_lock:
+            if name not in self._schemas:
+                with self._db() as db:
+                    initialize(db)
+                self._schemas.add(name)
 
     def _prune(self, db):
         cutoff = self._clock() - self._ttl_s
@@ -133,17 +176,22 @@ class HistoryOutbox:
 
     def _check(self, db, owner: HistoryOwner, connection_id: str, generation: int):
         row = db.execute(
-            "SELECT owner,generation FROM connections WHERE scope=?",
+            "SELECT owner,generation,touched FROM connections WHERE scope=?",
             (self._scope(owner, connection_id),),
         ).fetchone()
-        if row is None or row["owner"] != owner.key or row["generation"] != generation:
+        if (
+            row is None
+            or row["owner"] != owner.key
+            or row["generation"] != generation
+            or row["touched"] < self._clock() - self._ttl_s
+        ):
             raise HistoryError("stale_generation")
 
     def begin(
         self, owner: HistoryOwner, connection_id: str, *, expected_generation: int | None = None
     ) -> int:
         scope = self._scope(owner, connection_id)
-        with self._db() as db:
+        with self._db(prune=True) as db:
             if expected_generation is not None:
                 self._check(db, owner, connection_id, expected_generation)
             row = db.execute(
@@ -161,15 +209,26 @@ class HistoryOutbox:
             return generation
 
     def check(self, owner: HistoryOwner, connection_id: str, generation: int):
-        with self._db() as db:
+        with self._db(write=False) as db:
             self._check(db, owner, connection_id, generation)
+            touched = db.execute(
+                "SELECT touched FROM connections WHERE scope=?",
+                (self._scope(owner, connection_id),),
+            ).fetchone()[0]
+        if self._clock() - touched >= self._maintenance_interval:
+            with self._db() as db:
+                self._check(db, owner, connection_id, generation)
+                db.execute(
+                    "UPDATE connections SET touched=? WHERE scope=?",
+                    (self._clock(), self._scope(owner, connection_id)),
+                )
 
     @contextmanager
     def fenced(
-        self, owner: HistoryOwner, connection_id: str, generation: int
+        self, owner: HistoryOwner, connection_id: str, generation: int, *, write: bool = True
     ) -> Iterator[sqlite3.Connection]:
         """Atomic generation fence for shared derived-state projections, never host state."""
-        with self._db() as db:
+        with self._db(prune=write, write=write) as db:
             self._check(db, owner, connection_id, generation)
             yield db
 
@@ -185,7 +244,7 @@ class HistoryOutbox:
         encoded = json.dumps([row.wire() for row in event.messages], ensure_ascii=False)
         size = len(encoded.encode("utf-8"))
         fingerprint = digest([event.owner.key, event.origin_turn_id, encoded])
-        with self._db() as db:
+        with self._db(prune=True) as db:
             self._check(db, event.owner, event.connection_id, event.generation)
             prior = db.execute(
                 "SELECT payload_hash FROM events WHERE event_id=?", (event.event_id,)
@@ -230,7 +289,15 @@ class HistoryOutbox:
             )
 
     def get(self, owner: HistoryOwner, event_id: str) -> PendingHistory:
-        with self._db() as db:
+        # Expired content is scrubbed on discovery, not by every normal read.
+        with self._db(write=False) as db:
+            created = db.execute(
+                "SELECT created FROM events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        if created and created[0] < self._clock() - self._ttl_s:
+            with self._db() as db:
+                self._prune(db)
+        with self._db(write=False) as db:
             row = db.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
             if row is None:
                 raise HistoryError("unknown_event")
@@ -341,19 +408,19 @@ class HistoryOutbox:
     def pending(self, owner: HistoryOwner) -> tuple[str, ...]:
         if owner.profile != self._profile:
             raise HistoryError("owner_mismatch")
-        with self._db() as db:
+        with self._db(write=False) as db:
             return tuple(
                 row[0]
                 for row in db.execute(
-                    "SELECT event_id FROM events WHERE owner=? AND state='pending' "
+                    "SELECT event_id FROM events WHERE owner=? AND state='pending' AND created>=? "
                     "ORDER BY created,rowid",
-                    (owner.key,),
+                    (owner.key, self._clock() - self._ttl_s),
                 )
             )
 
     def diagnostics(self) -> dict:
         """Counts and enumerated states only; no text, paths, credentials or owner IDs."""
-        with self._db() as db:
+        with self._db(write=False) as db:
             counts = {state: 0 for state in ("pending", "saved", "failed", "conflicted")}
             for state, count in db.execute("SELECT state,count(*) FROM events GROUP BY state"):
                 if state in counts:

@@ -45,7 +45,7 @@ async def connected(*, held=None, supports_context=True, speech=None, response_c
     session = Session()
     session.supports_live_context = supports_context
     controller = NativeLiveTaskController(
-        api, session, {"task": api.context}, Audio(), on_notice=notices.append
+        api, session, {"task": api.context}, Audio(), on_notice=notices.append, capture_store=False
     )
     await controller.handle(rt.SessionReady("real-provider-session"))
     return SimpleNamespace(
@@ -171,6 +171,7 @@ def test_typed_live_input_uses_direct_canonical_route_without_fake_delegation(su
             "provider_session_id": "real-provider-session",
             "input_id": "typed-one",
             "text": "Exactly my typed words",
+            "admission": "async",
         }
         assert not any(
             isinstance(command, (rt.AddInputText, rt.SubmitDelegationResult))
@@ -298,7 +299,7 @@ def test_final_provider_item_retry_keeps_one_fragment_identity_and_no_new_author
     asyncio.run(scenario())
 
 
-def test_live_speech_uses_bounded_server_content_and_records_only_sent_transport():
+def test_live_speech_records_context_but_never_claims_correlated_playback():
     async def scenario():
         h = await connected(
             speech={
@@ -313,8 +314,13 @@ def test_live_speech_uses_bounded_server_content_and_records_only_sent_transport
         assert h.session.sent == [
             rt.AppendLiveContext("The original job completed.", kind="message")
         ]
-        receipt = next(body for path, body in h.requests if path == "receipt")
-        assert receipt["state"] == "sent" and receipt["attempt_id"] == "attempt-one"
+        receipts = [body for path, body in h.requests if path == "receipt"]
+        assert [body["state"] for body in receipts] == [
+            "submitting", "context_submitted", "unknown"
+        ]
+        assert all(body["attempt_id"] == "attempt-one" for body in receipts)
+        request = next(body for path, body in h.requests if path == "speech")
+        assert request["presentation_protocol"] == 1 and request["playback_supported"] is False
         await h.controller.handle(
             rt.Transcript(
                 rt.TranscriptRole.ASSISTANT,
@@ -329,6 +335,40 @@ def test_live_speech_uses_bounded_server_content_and_records_only_sent_transport
         assert not any(path == "delegation" for path, _ in h.requests)
         fragment = next(body for path, body in h.requests if path == "transcript")["fragments"][0]
         assert fragment["synthetic"] is True
+        await close(h)
+
+    asyncio.run(scenario())
+
+
+def test_live_summary_failed_handoff_is_unknown_and_explicit_replay_only_appends_context():
+    async def scenario():
+        h = await connected(speech={
+            "ok": True, "speak": True, "event_id": "event-one", "attempt_id": "attempt-one",
+            "content": "The saved result.",
+        })
+        original = h.session.send
+
+        async def fail(commands):
+            assert h.requests[-1][1]["state"] == "submitting"
+            raise OSError("Live handoff failed")
+
+        h.session.send = fail
+        with pytest.raises(OSError, match="handoff"):
+            await h.controller._speak({"event_id": "event-one"})
+        assert [body["state"] for path, body in h.requests if path == "receipt"] == [
+            "submitting", "unknown"
+        ]
+        h.session.send = original
+        await h.controller.command("/replay event-one")
+        request = [body for path, body in h.requests if path == "speech"][-1]
+        assert request["replay"] is True and request["playback_supported"] is False
+        assert h.session.sent == [rt.AppendLiveContext("The saved result.", kind="message")]
+        await h.controller.handle(rt.OutputTurnCompleted())
+        await h.controller.tick()
+        assert {path for path, _ in h.requests} == {"speech", "receipt"}
+        assert not any(
+            body.get("state") == "playback_finished" for _, body in h.requests
+        )
         await close(h)
 
     asyncio.run(scenario())

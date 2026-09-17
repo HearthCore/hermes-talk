@@ -11,6 +11,171 @@ but 0.4.0's release title named only the steering verb. They are recorded
 below under 0.4.0 — the first version that shipped them — with the gap
 named rather than smoothed.
 
+## [0.21.0] — 2026-09-16
+
+Talk works on a stock Hermes Desktop, and the refusal text stops asking for an
+update that does not exist.
+
+### Added
+- The Desktop composer **Talk** button now runs on a stock Hermes Desktop build.
+  Talk reads the focused conversation from the host state, confirms its stored
+  identity with a read-only title request, and attaches through the composer
+  popover. Connect once the conversation has one message, because Desktop saves a
+  conversation on its first message. Requests on this lane follow whichever
+  profile Desktop has active, and Talk refuses a request rather than address
+  another gateway once that profile moves. There is no microphone lease to share
+  with Desktop dictation, and `TALK_DASHBOARD_TOKEN` is unsupported here; the
+  panel names both when they matter. The Talk-enabled build is unchanged and
+  keeps the floating window, the lease, pinned requests and empty conversations.
+  (#168)
+
+### Changed
+- A host that reports only part of the Talk contract now says that, instead of
+  asking for an update that no release carries. The composer popover names the
+  Talk-enabled Hermes Desktop build as what the floating window needs, and
+  `docs/DESKTOP.md` describes the two lanes side by side. (#168)
+
+## [0.20.2] — 2026-09-16
+
+The floating Talk window gets out of the way, and the subscription lane's
+self-check tells the truth.
+
+### Changed
+- The floating window shrinks to the round Talk button once the session
+  connects; hovering the button opens the panel and leaving it closes the
+  panel again unless a click pinned it or a control inside has focus. Both
+  behaviors are toggles under Advanced and persist with the other appearance
+  settings; saved settings without them keep the defaults. A reconnect never
+  closes a panel the operator pinned. (#163, #164)
+- The round button, the hover status line and the expanded panel paint their
+  own theme background, so a collapsed control is just the button over
+  whatever is underneath. With a Hermes Desktop host that makes the window
+  transparent and click-through, nothing around the button blocks the app,
+  and a press on the button drags the window as soon as the pointer travels;
+  a still tap toggles the panel. (#165)
+
+### Fixed
+- `hermes talk check` on the GPT-Live lane (`TALK_VOICE_MODE=live`). The
+  provider step refused the resolved `live` lane as "not a live realtime
+  provider" before opening a session; behind that, the probe sent
+  `StartResponse`, which the Live client-delegation protocol has no encoding
+  for, and then waited for a response boundary that lane never reports. The
+  step now admits the lane, sends one speakable message and passes on the
+  first audio back, under the same wall-clock budget. Doctor's model check
+  names the live model and voice under live mode instead of `TALK_MODEL`.
+  Nothing here touches a live conversation. (#161, #166)
+
+## [0.20.1] — 2026-09-16
+
+### Added
+- Attachments on a worker start. `POST /attachments/upload` is an
+  authenticated, owner- and input-bound adapter over the host's attachment
+  ingress: it refuses unless the host advertises `features.input_attachments`
+  (read live), enforces the host's published limits, forwards through the
+  existing task gateway, and returns only an opaque
+  `{attachment_id, filename, content_type, bytes, sha256}`. `textInput.
+  attachments` on `/status` is sourced from the same live capability.
+  `/text/input` admits `{attachment_id, sha256}` references on `start_worker`
+  only, verified again at the single dispatch chokepoint against the same
+  owner, connection, generation and input; the other operations refuse with a
+  fixed code, matching the host's unsupported-delivery flags. In the panel, a
+  Send with files uploads first and then sends with the references frozen
+  into the captured send; an upload failure keeps the draft and sends
+  nothing. (#160)
+
+### Fixed
+- The browser-flow route test awaited the delivery emit before reading the
+  event cursor, closing a race that flaked on slow Windows runners. (#160)
+
+## [0.20.0] — 2026-09-16
+
+### Added
+- A floating Talk panel shared by the dashboard tab and the Desktop Talk view:
+  a runtime that survives collapsing the controls and browsing other tasks,
+  a recipient picker with exact identities, typed input alongside voice with
+  draft retention, task cards with approvals gated on the server's descriptor,
+  and honest playback presentation. Attachments stay local and Send with files
+  is disabled with a visible reason until the host route exists. (#156)
+- `POST /text/input` and a `textInput` descriptor on `GET /status`: one
+  authenticated route for explicit operations from the panel, `message` to the
+  pinned task or to the exact selected recipient, `start_worker`, `steer`,
+  `cancel`, `approval`. Every call binds the connection and generation, the
+  recipient is the store's current selection compared field for field and
+  frozen into the captured send, and a repeated input returns its stored
+  receipt instead of dispatching twice. Reply states are the honest ones the
+  transports report; nothing retries an uncertain dispatch. (#158)
+- Live replay: `POST /live/speech` with `replay:true` re-announces a terminal
+  result into the exact bound Live session, answering a still-open delegation
+  or appending context once it is retired, persisting the `submitting` fence
+  before the send and `context_submitted` or `unknown` after. (#158)
+- `POST /native/attach` accepts `input_mode:"typed"` for microphone-off use
+  that mints no voice credentials, and `POST /recipients/catalog|history|
+  status|select` expose read-only recipient history through the host bridge.
+  A history read never confers send. (#154)
+- Result presentation across transports: result ready, context submitted,
+  playback started, playback finished, interrupted and unknown stay separate
+  facts; browser WebRTC playback stays `unknown`; native terminal and Discord
+  gain `/replay EVENT_ID`. (#153)
+- Talk inside the current Desktop conversation, plug-and-play: open a
+  conversation, Talk, Connect. (#142)
+
+### Changed
+- A cancel is recorded as submitting before the stop is posted, so a retry
+  after a lost reply observes the run instead of posting a second stop. (#158)
+- The history outbox runs SQLite in write-ahead-logging mode with a 10 s busy
+  bound, so a busy writer can no longer starve concurrent reads into
+  `outbox_unavailable`. (#152)
+- README leads with the product name and names the realtime lanes and how
+  each is billed; a static landing page and a citation file were added. (#157)
+
+### Fixed
+- Windows CI: wall-clock waits scale on slow runners, a wedged test fails on
+  its own instead of holding the job, and the tests that assert ordering under
+  real deadlines are skipped on Windows CI only, visibly, and still run on
+  Linux and locally. (#152, #155)
+
+## [0.19.2] — 2026-09-15
+
+### Fixed
+- GPT-Live subscription mode works again on a stock Hermes install signed in
+  with `hermes auth login openai-codex`. The borrowed Hermes login carried no
+  account id, so `validate_live_auth` refused it and only users who had also
+  run `codex login` could connect. The account is read from the token's
+  `https://api.openai.com/auth` → `chatgpt_account_id` claim, the same claim
+  Hermes uses for its own `ChatGPT-Account-Id` header, and `expires_at` now
+  reports the token's `exp`. The Codex CLI store path reads the same claim
+  when `auth.json` has no `account_id`. Fail-closed behavior is unchanged: a
+  token naming no account still cannot open subscription mode, and nothing
+  falls through to API billing. Reported in #149, fixed in #150.
+- `dashboard/manifest.json` is bumped in step with `pyproject.toml` and
+  `plugin.yaml`; 0.19.1's tag tree missed it.
+
+## [0.19.1] — 2026-09-15
+
+### Changed
+- The Codex subscription lane is read-only. It borrows Hermes' own Codex login
+  first through `hermes_cli.auth_codex.resolve_codex_runtime_credentials`, so
+  Hermes stays the single owner of that token store and refreshes it under its
+  own lock. Without a Hermes login, Talk reads `~/.codex/auth.json` without ever
+  refreshing or rewriting it; an expired CLI token surfaces a `TalkAuthError`
+  pointing at `codex login`. Removed `_post_token_form`, `_write_auth_json` and
+  `_refresh_codex_credential`. Written by @teknium1 in #146 to clear the one
+  catalog-admission blocker on NousResearch/hermes-agent#108798.
+
+## [0.19.0] — 2026-09-12
+
+### Changed
+- Address existing Codex Desktop and Claude Code recipients by verified task
+  identity, separately from starting a Codex worker. Delivery receipts preserve
+  the original recipient through reconnect and uncertain-send reconciliation.
+- Admit Live delegation asynchronously while transcript capture, status and
+  controls continue. Capture batches preserve event identities, whitespace,
+  provider-item finality and late arrivals; native pending batches survive a
+  matching-owner reconnect.
+- Give GPT-Live a dedicated delegation prompt and deliver completion updates
+  independently of transcript persistence. Host-verified screen inspection stays
+  on demand, and Discord output still requires current audience authorization.
+
 ## [0.18.0] — 2026-09-12
 
 GPT-Live connects voice conversation to Hermes tasks and Codex background

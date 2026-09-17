@@ -76,6 +76,9 @@ class ApprovalReader:
 
 class TaskEvents:
     UPDATE_MODES = ("important", "completion", "frequent")
+    TERMINAL = frozenset({"completed", "failed", "cancelled", "lost"})
+    ACTIVE_SPEECH = frozenset({"queued", "submitting", "sent", "playback_started"})
+    CLAIM_SECONDS = 30.0
 
     def __init__(
         self,
@@ -125,15 +128,34 @@ class TaskEvents:
                 event_idx INTEGER PRIMARY KEY REFERENCES task_events(idx) ON DELETE CASCADE,
                 attempt_id TEXT NOT NULL, generation INTEGER NOT NULL, connection_id TEXT NOT NULL,
                 state TEXT NOT NULL, playback_supported INTEGER NOT NULL)""")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(task_event_speech)")}
+            for name, declaration in {
+                "protocol": "INTEGER NOT NULL DEFAULT 0",
+                "claim_expires": "REAL",
+                "retry_at": "REAL NOT NULL DEFAULT 0",
+                "retry_count": "INTEGER NOT NULL DEFAULT 0",
+                "attempt_order": "INTEGER NOT NULL DEFAULT 0",
+                "response_id": "TEXT",
+                "facts": "TEXT NOT NULL DEFAULT '{}'",
+            }.items():
+                if name not in columns:
+                    db.execute(f"ALTER TABLE task_event_speech ADD COLUMN {name} {declaration}")
             self._prune(db)
             self._ensure_owner(db)
             # Reconnection is not proof an interrupted handoff played. Never requeue.
-            db.execute(
-                """UPDATE task_event_speech SET state='unknown' WHERE connection_id=?
-                AND generation!=? AND state IN ('queued','sent') AND event_idx IN
+            stale = db.execute(
+                """SELECT * FROM task_event_speech WHERE connection_id=?
+                AND generation!=? AND state IN ('queued','submitting','sent','playback_started')
+                AND event_idx IN
                 (SELECT idx FROM task_events WHERE owner=?)""",
                 (token.connection_id, token.generation, self._owner.key),
-            )
+            ).fetchall()
+            for row in stale:
+                db.execute(
+                    "UPDATE task_event_speech SET state='unknown',facts=?,claim_expires=NULL "
+                    "WHERE event_idx=?",
+                    (json.dumps({**self._speech_facts(row), "unknown": True}), row["event_idx"]),
+                )
 
     def preferences(self, token):
         with self._fenced(token) as db:
@@ -226,9 +248,28 @@ class TaskEvents:
         # Expiration commits even when the requested observation/read is later refused.
         with self._fenced(token) as db:
             self._prune(db)
+            self._expire_speech(db)
         with self._fenced(token) as db:
             self._ensure_owner(db)
             yield db
+
+    def _expire_speech(self, db):
+        rows = db.execute(
+            "SELECT s.* FROM task_event_speech s JOIN task_events e ON e.idx=s.event_idx "
+            "WHERE e.owner=? AND s.claim_expires<=? "
+            "AND s.state IN ('queued','submitting','sent','playback_started')",
+            (self._owner.key, self._clock()),
+        ).fetchall()
+        for row in rows:
+            state = "deferred" if row["state"] == "queued" and row["protocol"] == 1 else "unknown"
+            facts = self._speech_facts(row)
+            if state == "unknown":
+                facts["unknown"] = True
+            db.execute(
+                "UPDATE task_event_speech SET state=?,facts=?,claim_expires=NULL,retry_at=? "
+                "WHERE event_idx=?",
+                (state, json.dumps(facts), self._clock(), row["event_idx"]),
+            )
 
     def bind_run(
         self,
@@ -629,6 +670,7 @@ class TaskEvents:
                     "observed_index": row["idx"],
                     "source_epoch": row["epoch"],
                     "delivery": row["delivery"] or "unclaimed",
+                    "presentation": self._presentation(db, row),
                     "replay": True,
                 }
                 for row in rows
@@ -676,32 +718,117 @@ class TaskEvents:
                 "SELECT update_mode FROM task_preferences WHERE owner=?", (self._owner.key,)
             ).fetchone()
             mode = preference[0] if preference else "important"
-            rows = db.execute(
-                "SELECT e.*,s.state AS delivery FROM task_events e "
-                "LEFT JOIN task_event_speech s ON s.event_idx=e.idx "
-                "WHERE e.owner=? ORDER BY e.idx DESC", (self._owner.key,)
-            ).fetchall()
-            latest, selected, result = {}, set(), []
-            for row in rows:
+            result = []
+            for row in self._latest_notices(db):
                 event = json.loads(row["data"])
-                signature = tuple(
-                    event.get(key) for key in ("kind", "state", "label", "approval_id")
-                )
-                source = row["source_id"]
-                latest.setdefault(source, signature)
-                if (source in selected or signature != latest[source] or not row["live"]
+                if (not row["live"]
                     or row["connection_id"] != token.connection_id
                     or row["generation"] != token.generation):
                     continue
-                selected.add(source)
-                if row["delivery"] is None and self._speech_eligible(event, mode):
+                if self._retryable(row) and self._speech_eligible(event, mode):
                     result.append(event)
-            return list(reversed(result[:8]))
+            return list(reversed(result))[:8]
 
-    def queue_speech(self, token, event_id, *, playback_supported=False, respect_preference=False):
+    def _latest_notices(self, db):
+        rows = db.execute(
+            "SELECT e.*,s.state AS delivery,s.retry_at,s.attempt_order FROM task_events e "
+            "LEFT JOIN task_event_speech s ON s.event_idx=e.idx "
+            "WHERE e.owner=? ORDER BY e.idx DESC", (self._owner.key,)
+        ).fetchall()
+        latest, selected, closed = {}, {}, set()
+        for row in rows:
+            event = json.loads(row["data"])
+            source = row["source_id"]
+            signature = tuple(event.get(key) for key in ("kind", "state", "label", "approval_id"))
+            latest.setdefault(source, signature)
+            if signature != latest[source]:
+                closed.add(source)
+            if source in closed:
+                continue
+            prior = selected.get(source)
+            if prior is None or (row["delivery"] is not None and (
+                prior["delivery"] is None or row["attempt_order"] > prior["attempt_order"]
+            )) or (
+                row["delivery"] is None and prior["delivery"] is None
+                and row["live"] and not prior["live"]
+            ):
+                selected[source] = row
+        return sorted(selected.values(), key=lambda row: row["idx"], reverse=True)
+
+    def _retryable(self, row):
+        return row["delivery"] is None or (
+            row["delivery"] == "deferred" and row["retry_at"] <= self._clock()
+        )
+
+    @staticmethod
+    def _speech_facts(row):
+        facts = json.loads(row["facts"])
+        if row["state"] in {"sent", "playback_started", "playback_acknowledged"}:
+            facts["context_submitted"] = True
+        if row["state"] in {"playback_started", "playback_acknowledged"}:
+            facts["playback_started"] = True
+        if row["state"] == "playback_acknowledged":
+            facts["playback_finished"] = True
+        if row["state"] in {"unknown", "interrupted"}:
+            facts[row["state"]] = True
+        return facts
+
+    def _presentation(self, db, event):
+        data = json.loads(event["data"])
+        speech = db.execute(
+            "SELECT * FROM task_event_speech WHERE event_idx=?", (event["idx"],)
+        ).fetchone()
+        ready = data.get("state") in self.TERMINAL and data.get("run_id") is not None
+        state = "result_ready" if ready else "unclaimed"
+        facts = {}
+        if speech:
+            state = {"queued": "claimed", "sent": "context_submitted",
+                     "playback_acknowledged": "playback_finished"}.get(
+                         speech["state"], speech["state"]
+                     )
+            facts = self._speech_facts(speech)
+        return {
+            "event_id": data["event_id"], "operation_id": data.get("action_id"),
+            "run_id": data.get("run_id"), "attempt_id": speech["attempt_id"] if speech else None,
+            "state": state, "result_ready": ready,
+            **{key: bool(facts.get(key)) for key in (
+                "context_submitted", "playback_started", "playback_finished", "interrupted",
+                "unknown",
+            )},
+            "response_id": speech["response_id"] if speech else None,
+            "replay_eligible": ready and (not speech or speech["state"] not in self.ACTIVE_SPEECH),
+            "retry_at": speech["retry_at"] if speech and speech["state"] == "deferred" else None,
+            "claim_expires_at": speech["claim_expires"] if speech else None,
+        }
+
+    def presentation(self, token, event_id):
+        with self._db(token) as db:
+            return self._presentation(db, self._event(db, event_id))
+
+    def job_presentations(self, token):
+        with self._db(token) as db:
+            return {data["run_id"]: self._presentation(db, row)
+                    for row in self._latest_notices(db)
+                    if (data := json.loads(row["data"])).get("run_id") is not None}
+
+    def replay_event(self, token, event_id):
         with self._db(token) as db:
             event = self._event(db, event_id)
-            if respect_preference:
+            if not self._presentation(db, event)["replay_eligible"]:
+                raise TaskEventError("replay_not_speakable")
+            return json.loads(event["data"])
+
+    def queue_speech(self, token, event_id, *, playback_supported=False, respect_preference=False,
+                     presentation_protocol=0, replay=False):
+        if (type(presentation_protocol) is not int or presentation_protocol not in {0, 1}
+                or type(playback_supported) is not bool or type(replay) is not bool):
+            raise TaskEventError("invalid_delivery")
+        with self._db(token) as db:
+            event = self._event(db, event_id)
+            if replay:
+                if not self._presentation(db, event)["replay_eligible"]:
+                    raise TaskEventError("replay_not_speakable")
+            elif respect_preference:
                 preference = db.execute(
                     "SELECT update_mode FROM task_preferences WHERE owner=?", (self._owner.key,)
                 ).fetchone()
@@ -709,25 +836,50 @@ class TaskEvents:
                     json.loads(event["data"]), preference[0] if preference else "important"
                 ):
                     raise TaskEventError("replay_not_speakable")
-            if not event["live"] or (event["generation"], event["connection_id"]) != (
+            if not replay and (not event["live"] or (
+                event["generation"], event["connection_id"]
+            ) != (
                 token.generation,
                 token.connection_id,
-            ):
+            )):
                 raise TaskEventError("replay_not_speakable")
+            prior = db.execute(
+                "SELECT * FROM task_event_speech WHERE event_idx=?", (event["idx"],)
+            ).fetchone()
+            if prior and not replay and (
+                prior["state"] != "deferred" or prior["retry_at"] > self._clock()
+            ):
+                raise TaskEventError("delivery_exists")
+            if respect_preference and not replay and not any(
+                row["event_id"] == event_id and self._retryable(row)
+                for row in self._latest_notices(db)
+            ):
+                raise TaskEventError("delivery_exists")
             if db.execute(
-                "SELECT 1 FROM task_event_speech WHERE event_idx=?", (event["idx"],)
+                "SELECT 1 FROM task_event_speech s JOIN task_events e ON e.idx=s.event_idx "
+                "WHERE e.owner=? AND s.state IN ('queued','submitting','sent','playback_started')",
+                (self._owner.key,),
             ).fetchone():
                 raise TaskEventError("delivery_exists")
             attempt = uuid.uuid4().hex
+            order = db.execute(
+                "UPDATE metadata SET next_generation=next_generation+1 RETURNING next_generation"
+            ).fetchone()[0]
             db.execute(
-                "INSERT INTO task_event_speech VALUES (?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO task_event_speech "
+                "(event_idx,attempt_id,generation,connection_id,state,playback_supported,protocol,"
+                "claim_expires,retry_count,attempt_order) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (
                     event["idx"],
                     attempt,
                     token.generation,
                     token.connection_id,
                     "queued",
-                    int(playback_supported is True),
+                    int(playback_supported),
+                    presentation_protocol,
+                    self._clock() + self.CLAIM_SECONDS,
+                    prior["retry_count"] if prior and not replay else 0,
+                    order,
                 ),
             )
             return SpeechAttempt(event_id, attempt, token)
@@ -738,40 +890,93 @@ class TaskEvents:
             raise TaskEventError("invalid_delivery")
         with self._db(token) as db:
             event = self._event(db, attempt.event_id)
-            changed = db.execute(
-                "DELETE FROM task_event_speech WHERE event_idx=? AND attempt_id=? "
-                "AND connection_id=? AND generation=? AND state='queued'",
-                (event["idx"], attempt.attempt_id, token.connection_id, token.generation),
-            ).rowcount
-            if changed != 1:
+            row = self._attempt(db, token, event, attempt)
+            if row["state"] == "deferred":
+                return
+            if row["state"] != "queued":
                 raise TaskEventError("invalid_delivery")
+            if row["protocol"] == 0:
+                db.execute("DELETE FROM task_event_speech WHERE event_idx=?", (event["idx"],))
+            else:
+                delay = min(5.0, 0.25 * 2 ** min(row["retry_count"], 5))
+                db.execute(
+                    "UPDATE task_event_speech SET state='deferred',claim_expires=NULL,retry_at=?,"
+                    "retry_count=retry_count+1 WHERE event_idx=?",
+                    (self._clock() + delay, event["idx"]),
+                )
 
-    def acknowledge_speech(self, token, attempt, state):
-        if attempt.capture != token or state not in {"sent", "playback_acknowledged", "unknown"}:
+    def _attempt(self, db, token, event, attempt):
+        row = db.execute(
+            "SELECT * FROM task_event_speech WHERE event_idx=? AND attempt_id=?",
+            (event["idx"], attempt.attempt_id),
+        ).fetchone()
+        if row is None or (row["generation"], row["connection_id"]) != (
+            token.generation, token.connection_id,
+        ):
             raise TaskEventError("invalid_delivery")
+        return row
+
+    def acknowledge_speech(self, token, attempt, state, *, response_id=None):
+        if attempt.capture != token or not isinstance(state, str) or state not in {
+            "submitting", "sent", "context_submitted", "playback_started", "playback_finished",
+            "playback_acknowledged", "interrupted", "unknown", "renewed",
+        }:
+            raise TaskEventError("invalid_delivery")
+        state = {"context_submitted": "sent", "playback_finished": "playback_acknowledged"}.get(
+            state, state
+        )
         with self._db(token) as db:
             event = self._event(db, attempt.event_id)
-            row = db.execute(
-                "SELECT * FROM task_event_speech WHERE event_idx=? AND attempt_id=?",
-                (event["idx"], attempt.attempt_id),
-            ).fetchone()
-            if row is None or (row["generation"], row["connection_id"]) != (
-                token.generation,
-                token.connection_id,
+            row = self._attempt(db, token, event, attempt)
+            if state == "renewed":
+                if row["state"] != "queued" or row["protocol"] != 1:
+                    raise TaskEventError("invalid_delivery")
+                db.execute("UPDATE task_event_speech SET claim_expires=? WHERE event_idx=?",
+                           (self._clock() + self.CLAIM_SECONDS, event["idx"]))
+                return
+            if response_id is not None:
+                identifier(response_id)
+                if row["response_id"] is not None and row["response_id"] != response_id:
+                    raise TaskEventError("invalid_delivery")
+            if state in {"playback_started", "playback_acknowledged"} and (
+                not row["playback_supported"] or (row["protocol"] == 1 and not response_id)
             ):
                 raise TaskEventError("invalid_delivery")
+            facts = self._speech_facts(row)
+            fact = {"sent": "context_submitted", "playback_acknowledged": "playback_finished"}.get(
+                state, state
+            )
+            if facts.get(fact):
+                return
+            if state == "sent" and row["state"] in {"interrupted", "unknown"} and (
+                facts.get("submitting") or row["protocol"] == 0
+            ):
+                facts["context_submitted"] = True
+                db.execute("UPDATE task_event_speech SET facts=? WHERE event_idx=?",
+                           (json.dumps(facts), event["idx"]))
+                return
             allowed = {
-                "queued": {"sent", "unknown"},
-                "sent": {"unknown"},
-                "unknown": set(),
+                "queued": {"submitting", "unknown", "interrupted"},
+                "submitting": {"sent", "unknown", "interrupted"},
+                "sent": {"playback_started", "unknown", "interrupted"},
+                "playback_started": {"playback_acknowledged", "unknown", "interrupted"},
+                "unknown": {"interrupted"},
+                "interrupted": set(),
+                "deferred": set(),
                 "playback_acknowledged": set(),
             }
-            if row["playback_supported"]:
+            if row["protocol"] == 0:
+                allowed["queued"].add("sent")
                 allowed["sent"].add("playback_acknowledged")
             if state != row["state"] and state not in allowed[row["state"]]:
                 raise TaskEventError("invalid_delivery")
+            facts[fact] = True
             db.execute(
-                "UPDATE task_event_speech SET state=? WHERE event_idx=?", (state, event["idx"])
+                "UPDATE task_event_speech SET state=?,facts=?,response_id=coalesce(response_id,?),"
+                "claim_expires=? WHERE event_idx=?",
+                (state, json.dumps(facts), response_id,
+                 self._clock() + self.CLAIM_SECONDS if state in self.ACTIVE_SPEECH else None,
+                 event["idx"]),
             )
 
     def _event(self, db, event_id):
@@ -819,7 +1024,7 @@ class TaskEvents:
             output = run.get("output") if run["status"] != "running" else None
             return {
                 "status": run.get("status"),
-                "output": output[:4000] if isinstance(output, str) else "",
+                "output": output if isinstance(output, str) else "",
                 "speak": False,
                 "source": "current_run_record",
             }

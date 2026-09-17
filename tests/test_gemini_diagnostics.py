@@ -41,7 +41,9 @@ def isolated_gemini(monkeypatch, tmp_path):
 
     monkeypatch.setattr(talk_auth, "auth_diagnostic", forbidden)
     monkeypatch.setattr(talk_doctor.talk_grok_auth, "grok_auth_diagnostic", forbidden)
-    monkeypatch.setattr(talk_auth.httpx, "post", forbidden)
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", forbidden)
     talk_host.bind_ctx(None)
     talk_tools.REGISTRATION_RECEIPTS.clear()
     talk_tools.REGISTRATION_FAILURES.clear()

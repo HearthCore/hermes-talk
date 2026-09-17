@@ -51,7 +51,8 @@ def mount_live_routes(
                 raise failure
 
             return await task_call(raise_domain_error, request, body)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, http_exception):
+            # An already-mapped refusal keeps its own status; only unmapped failures collapse.
             raise
         except Exception:  # noqa: BLE001 - upstream auth/session details are server-only
             raise http_exception(
@@ -93,6 +94,18 @@ def mount_live_routes(
 
         return await invoke(typed(), request, body)
 
+    @router.post("/live/flush")
+    async def live_flush(request: Request):
+        require_auth(request)
+        body = await read_body(request)
+
+        async def flush():
+            binding = await registry.binding(request, body, refresh=True)
+            await binding.flush_capture()
+            return {"ok": True}
+
+        return await invoke(flush(), request, body)
+
     @router.post("/live/close")
     async def live_close(request: Request):
         require_auth(request)
@@ -124,21 +137,75 @@ def mount_live_routes(
         body = await read_body(request)
         return await invoke(registry.coordinator.typed(request, body), request, body)
 
+    @router.get("/live/operation")
+    async def live_operation(request: Request):
+        require_auth(request)
+        query = request.query_params
+        try:
+            body = {
+                "connection_id": query.get("connection_id"),
+                "generation": int(query.get("generation", "")),
+                "operation_id": query.get("operation_id"),
+            }
+        except (TypeError, ValueError):
+            raise http_exception(
+                status_code=400, detail=DashboardTaskError("invalid_event", 400).detail(),
+            ) from None
+        return await task_call(registry.coordinator.operation, request, body)
+
     @router.post("/live/speech")
     async def live_speech(request: Request):
         require_auth(request)
         body = await read_body(request)
-        prepared = await task_call(tasks.speech, request, body)
-        return await task_call(lambda _request, value: speech_context(value), request, prepared)
+        if body.get("replay") is not True:
+            prepared = await task_call(tasks.speech, request, body)
+            return await task_call(
+                lambda _request, value: speech_context(value), request, prepared
+            )
+
+        async def replay():
+            """Re-announce one terminal result into the exact bound Live session.
+
+            Authorization is proven twice (the binding fence here, ``authorize`` inside
+            ``present``); result ownership and replay eligibility are ``tasks.speech``'s;
+            the persisted ``submitting`` receipt fences the send. No typed input, coordinator
+            decision, ledger row or staged interaction is involved.
+            """
+            if (body.get("presentation_protocol") != 1
+                    or body.get("playback_supported") is not False):
+                raise DashboardTaskError("invalid_event", 400)
+            binding = await registry.binding(request, body, refresh=True)
+            request_body = {key: body.get(key) for key in (
+                "connection_id", "generation", "event_id", "timing",
+                "presentation_protocol", "playback_supported", "replay",
+            )}
+            prepared = await task_call(tasks.speech, request, request_body)
+            speech = await task_call(
+                lambda _request, value: speech_context(value), request, prepared
+            )
+            if not speech.get("speak"):
+                return speech
+            # A job whose provider delegation is still open gets its result there; a
+            # retired delegation cannot be answered, so the summary is appended as context.
+            submitted = await binding.present(
+                speech, delegation_id=binding.open_delegation(speech["run_id"])
+            )
+            if submitted is None:
+                return {**speech, "speak": False, "reason": "dispatch_refused"}
+            return {**speech, "presentation": submitted.get("presentation")}
+
+        return await invoke(replay(), request, body)
 
     handlers = (
         live_session,
         live_events,
         live_input,
         live_close,
+        live_flush,
         live_transcript,
         live_delegation,
         live_typed,
+        live_operation,
         live_speech,
     )
     if hasattr(router, "add_event_handler"):

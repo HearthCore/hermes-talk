@@ -62,13 +62,16 @@ import talk_config  # noqa: E402
 import talk_dashboard_tasks  # noqa: E402
 import talk_host  # noqa: E402
 import talk_identity  # noqa: E402
+import talk_input_attachments  # noqa: E402
 import talk_live_config  # noqa: E402
 import talk_live_routes  # noqa: E402
 import talk_native_surface  # noqa: E402
 import talk_realtime  # noqa: E402
+import talk_recipients  # noqa: E402
 import talk_relay  # noqa: E402
 import talk_runs  # noqa: E402
 import talk_target_selection  # noqa: E402
+import talk_text_input  # noqa: E402
 import talk_tools  # noqa: E402
 import talk_wire  # noqa: E402
 from talk_dashboard_gateway import DashboardTaskError  # noqa: E402
@@ -180,6 +183,8 @@ TARGETS = talk_target_selection.TargetSelection(TASKS)
 
 DASHBOARD_TOKEN_ENV = "TALK_DASHBOARD_TOKEN"
 DASHBOARD_TOKEN_HEADER = "x-talk-token"
+DESKTOP_TOKEN_ENV = "HERMES_DESKTOP_TALK_TOKEN"
+DESKTOP_TOKEN_HEADER = "x-hermes-desktop-talk-token"
 
 #: Peers this process will serve when no token is configured. ``::ffff:127.0.0.1``
 #: is the IPv4-mapped form a dual-stack listener reports.
@@ -211,7 +216,7 @@ def dashboard_token() -> str | None:
 
 
 def _presented_token(request) -> str:
-    """The token this request carries, from either accepted header."""
+    """The token this request carries, including the Desktop plugin bridge."""
 
     getter = getattr(getattr(request, "headers", None), "get", None)
     if getter is None:
@@ -219,6 +224,9 @@ def _presented_token(request) -> str:
     direct = (getter(DASHBOARD_TOKEN_HEADER) or "").strip()
     if direct:
         return direct
+    plugin_token = (getter("x-hermes-plugin-token") or "").strip()
+    if plugin_token:
+        return plugin_token
     authorization = (getter("authorization") or "").strip()
     if authorization.lower().startswith("bearer "):
         return authorization[len("bearer ") :].strip()
@@ -239,6 +247,23 @@ def _is_loopback(request) -> bool:
     return host.strip().lower() in LOOPBACK_HOSTS
 
 
+def _has_desktop_auth(request, presented: str) -> bool:
+    """Accept the owned local Desktop bridge only with verified host identity."""
+
+    if not _is_loopback(request):
+        return False
+    configured = (os.environ.get(DESKTOP_TOKEN_ENV) or "").strip()
+    if not configured or not presented or not hmac.compare_digest(
+        presented.encode("utf-8"), configured.encode("utf-8")
+    ):
+        return False
+    try:
+        talk_dashboard_tasks.resolve_context(request)
+    except DashboardTaskError:
+        return False
+    return True
+
+
 def require_dashboard_auth(request) -> None:
     """Gate one request. Returns on success, raises otherwise — never a bool.
 
@@ -252,6 +277,13 @@ def require_dashboard_auth(request) -> None:
         # raising, and the comparison does not short-circuit on first mismatch.
         if presented and hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8")):
             return
+    getter = getattr(getattr(request, "headers", None), "get", None)
+    desktop_token = (getter(DESKTOP_TOKEN_HEADER) or "").strip() if getter else ""
+    if desktop_token:
+        if _has_desktop_auth(request, desktop_token):
+            return
+        raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
+    if configured is not None:
         raise HTTPException(status_code=401, detail=TOKEN_REQUIRED_MESSAGE)
     if _is_loopback(request):
         return
@@ -289,6 +321,23 @@ def _status_problem(setting: str, exc: Exception) -> str:
     return f" ({setting} unusable; see the dashboard log, ref {reference})"
 
 
+def _input_capabilities(request) -> dict:
+    """The host capability document behind the input descriptor. Worker thread only.
+
+    ``/status`` answers before any task is joined, so there is no binding to read
+    through — this resolves the caller's own context and configured gateway, the same
+    pair ``join()`` uses, and pays for one bounded read. Every refusal (no task
+    context, no configured gateway, an unreachable or slow host) is the same answer:
+    an empty document, which advertises ``attachments: false``.
+    """
+
+    try:
+        context = TASKS.resolve_context(request)
+        return talk_dashboard_tasks.TaskGateway(TASKS.transport_factory(context)).capabilities()
+    except Exception:  # noqa: BLE001 - a capability probe never fails the status tile
+        return {}
+
+
 def _warm_agent_lane() -> str:
     """Resolve the agent lane, paying for a cold probe. Worker thread only."""
 
@@ -307,7 +356,8 @@ def _session_tools(bound=None):
     if bound is not None:
         tools = [tool for tool in tools if tool["name"] in talk_dashboard_tasks.BOUND_TOOLS]
         tools += [
-            talk_dashboard_tasks.steering_tool(), talk_dashboard_tasks.update_preference_tool()
+            talk_dashboard_tasks.steering_tool(), talk_dashboard_tasks.update_preference_tool(),
+            *talk_recipients.recipient_tools(),
         ]
         if getattr(bound, "target_record", None) is not None:
             tools += talk_target_selection.selection_tools()
@@ -413,6 +463,8 @@ async def talk_status(request: Request) -> dict:
     """
 
     require_dashboard_auth(request)
+    # Read once, off the event loop, and hand the same document to both descriptors.
+    input_capabilities = await asyncio.to_thread(_input_capabilities, request)
     try:
         voice = talk_config.talk_voice()
     except talk_config.TalkConfigError as exc:
@@ -443,6 +495,7 @@ async def talk_status(request: Request) -> dict:
                            config.auth_mode == "subscription" else talk_live_config.API_VOICES),
             "version": talk_tools.plugin_version(),
             "taskContinuity": talk_dashboard_tasks.context_support(),
+            "textInput": talk_text_input.descriptor(input_capabilities),
             "agentLoop": "canonical_task",
         }
     status = talk_auth.auth_status()
@@ -457,6 +510,7 @@ async def talk_status(request: Request) -> dict:
         "voices": list(talk_config.OPENAI_REALTIME_VOICES),
         "version": talk_tools.plugin_version(),
         "taskContinuity": talk_dashboard_tasks.context_support(),
+        "textInput": talk_text_input.descriptor(input_capabilities),
         # Tri-state, not a bool: no plugin context is ever bound in the web
         # server process, so the only question that matters here is whether the
         # api_server lane can reach a real agent. This route is the page's
@@ -1079,6 +1133,11 @@ async def _task_call(function, request, body):
         raise HTTPException(status_code=exc.status, detail=exc.detail()) from exc
     except (HistoryError, TaskEventError) as exc:
         code = getattr(exc, "code", "")
+        status = (
+            403 if code in {"unauthorized", "denied", "owner_mismatch"}
+            else 503 if code in {"unavailable", "store_unavailable", "busy"}
+            else 409
+        )
         mapped = DashboardTaskError(
             {
                 "stale_generation": "connection_stale",
@@ -1088,9 +1147,10 @@ async def _task_call(function, request, body):
                 "unavailable": "target_offline",
                 "unsupported": "target_unsupported",
             }.get(code, "gateway_refused"),
-            409,
+            status,
+            retryable=status == 503,
         )
-        raise HTTPException(status_code=409, detail=mapped.detail()) from exc
+        raise HTTPException(status_code=status, detail=mapped.detail()) from exc
 
 
 async def _live_task_descriptor(bound, *, selection=None):
@@ -1101,7 +1161,8 @@ async def _live_task_descriptor(bound, *, selection=None):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"ok": True, "voiceMode": "live", "authSource": auth.source,
             "liveAuth": config.auth_mode, "model": config.model, "voice": config.voice,
-            "live": {"transport": "webrtc"}, "task": TASKS.descriptor(bound),
+            "live": {"transport": "webrtc", "delegation_admission": "async-v1"},
+            "task": TASKS.descriptor(bound),
             **({"selection": selection} if selection is not None else {})}
 
 
@@ -1216,13 +1277,18 @@ async def _target_session(request, body, *, initial=False):
 
 @router.post("/native/attach")
 async def native_task_attach(request: Request):
-    """Bind a native client through real dashboard authentication; mint no voice credentials."""
+    """Bind native voice or typed input through authenticated target activation."""
     require_dashboard_auth(request)
     body = await _json_body(request)
+    input_mode = body.get("input_mode", "voice")
+    if input_mode not in ("voice", "typed"):
+        raise HTTPException(
+            status_code=400, detail=DashboardTaskError("invalid_event", 400).detail()
+        )
     previous = (await _task_call(TASKS.binding, request, body)
                 if "connection_id" in body else None)
     selection_body = {key: value for key, value in body.items()
-                      if key not in talk_native_surface.FIELDS}
+                      if key not in talk_native_surface.FIELDS and key != "input_mode"}
     prepared = await _prepare_target(
         request, selection_body, initial="connection_id" not in selection_body, reconnect=True,
     )
@@ -1233,7 +1299,7 @@ async def native_task_attach(request: Request):
         bound = prepared.bound
         surface = asyncio.create_task(_task_call(
             lambda _request, data: talk_native_surface.prepare_surface(
-                bound, data, previous=previous), request, body,
+                bound, data, previous=previous, typed=input_mode == "typed"), request, body,
         ))
         try:
             surface_context = await asyncio.shield(surface)
@@ -1241,6 +1307,10 @@ async def native_task_attach(request: Request):
             with suppress(Exception):
                 await surface
             raise
+        if hasattr(request, "is_disconnected") and await request.is_disconnected():
+            raise HTTPException(
+                status_code=409, detail=DashboardTaskError("connection_stale", 409).detail()
+            )
         activation = asyncio.create_task(_task_call(TARGETS.activate, request, prepared))
         try:
             selection = await asyncio.shield(activation)
@@ -1249,14 +1319,29 @@ async def native_task_attach(request: Request):
             activated = True
             raise
         activated = True
+        await _task_call(TASKS.binding, request, {
+            "connection_id": bound.connection_id, "generation": bound.generation,
+        })
+        result = {"ok": True, "task": TASKS.descriptor(bound), "selection": selection,
+                  "voice_state": "not_connected", "surface_context": surface_context,
+                  "live_contract": {"delegation_admission": "async-v1",
+                                    "transcript_batch": {"flush_ms": 100, "fragments": 32,
+                                                         "bytes": 8192}}}
+        if input_mode == "typed":
+            return {**result, "input_mode": "typed"}
         tools = _session_tools(bound)
-        instructions = talk_identity.build_instructions(
-            None, tools=tools, lane=surface_context["surface"], canonical_task=True,
-            capabilities="Canonical task tools and linked child work are available.",
-        ) + "\n\n" + TASKS.instructions(bound)
-        return {"ok": True, "task": TASKS.descriptor(bound), "instructions": instructions,
-                "tools": tools, "selection": selection, "voice_state": "not_connected",
-                "surface_context": surface_context}
+        if _resolve_voice_mode() == "live":
+            instructions = talk_identity.build_live_instructions(
+                None, lane=surface_context["surface"],
+                capabilities=TASKS.live_capabilities(bound),
+                task_context=TASKS.live_instructions(bound),
+            )
+        else:
+            instructions = talk_identity.build_instructions(
+                None, tools=tools, lane=surface_context["surface"], canonical_task=True,
+                capabilities="Canonical task tools and linked child work are available.",
+            ) + "\n\n" + TASKS.instructions(bound)
+        return {**result, "instructions": instructions, "tools": tools}
     finally:
         if not activated:
             await asyncio.to_thread(TARGETS.cancel, prepared)
@@ -1333,6 +1418,22 @@ LIVE_ROUTE_HANDLERS, LIVE_SESSIONS = talk_live_routes.mount_live_routes(
     http_exception=HTTPException,
 )
 
+RECIPIENT_ROUTE_HANDLERS = talk_recipients.mount_recipient_routes(
+    router, require_auth=require_dashboard_auth, read_body=_json_body,
+    task_call=_task_call, service=TASKS.recipients,
+)
+
+ATTACHMENT_ROUTE_HANDLERS = talk_input_attachments.mount_attachment_routes(
+    router, require_auth=require_dashboard_auth, task_call=_task_call, tasks=TASKS,
+    http_exception=HTTPException,
+)
+
+TEXT_INPUT_ROUTE_HANDLERS = talk_text_input.mount_text_input_routes(
+    router, require_auth=require_dashboard_auth, read_body=_json_body,
+    task_call=_task_call, tasks=TASKS, coordinator=LIVE_SESSIONS.coordinator,
+    http_exception=HTTPException,
+)
+
 
 ROUTE_HANDLERS = (
     talk_status,
@@ -1352,6 +1453,9 @@ ROUTE_HANDLERS = (
     native_task_attach,
     task_switch,
     *LIVE_ROUTE_HANDLERS,
+    *RECIPIENT_ROUTE_HANDLERS,
+    *TEXT_INPUT_ROUTE_HANDLERS,
+    *ATTACHMENT_ROUTE_HANDLERS,
 )
 
 #: The WebSocket lanes. Kept beside ROUTE_HANDLERS because the gate is the

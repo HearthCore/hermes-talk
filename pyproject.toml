@@ -1,6 +1,6 @@
 [project]
 name = "hermes-talk"
-version = "0.18.0"
+version = "0.21.0"
 description = "Realtime speech-to-speech voice for Hermes Agent — OpenAI, xAI Grok, or Gemini Live — duplex talk with live tool calling."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ live = ["aiortc>=1.14,<2"]
 # the real class in CI that branch is untestable, which is exactly how the
 # relay deadlock shipped. `dashboard/plugin_api.py` still runs against its own
 # stub when starlette is absent, so the plugin installs without it.
-dev = ["pytest>=8", "ruff==0.16.6", "starlette>=0.40"]
+dev = ["pytest>=8", "pytest-timeout>=2.3", "ruff==0.16.7", "starlette>=0.40"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -48,6 +48,11 @@ py-modules = [
   "talk_native_api",
   "talk_native_controller",
   "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_text_input",
+  "talk_worker_recipients",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",
@@ -69,6 +74,7 @@ py-modules = [
   "talk_target_state",
   "talk_wire",
   "talk_identity",
+  "talk_input_attachments",
   "talk_passive",
   "talk_outbox",
   "talk_attachment",
@@ -105,6 +111,17 @@ py-modules = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# A wedged coordinator test used to sit until the CI job's 15-minute ceiling
+# and come back as "cancelled" with no stack. Now it fails on its own, with one,
+# well inside that ceiling. Thread method because Windows has no SIGALRM; note
+# it ends the whole pytest process (os._exit) at the first wedge, so you get one
+# stack and no summary for the tests after it, which is still strictly better
+# than a cancelled job.
+timeout = 180
+timeout_method = "thread"
+markers = [
+  "wall_clock: asserts ordering under real wall-clock deadlines; skipped on Windows CI (see tests/conftest.py)",
+]
 
 [tool.ruff]
 line-length = 100
@@ -150,6 +167,11 @@ known-first-party = [
   "talk_native_api",
   "talk_native_controller",
   "talk_native_live",
+  "talk_native_capture_store",
+  "talk_recipients",
+  "talk_recipient_store",
+  "talk_text_input",
+  "talk_worker_recipients",
   "talk_codex_wire",
   "talk_codex_store",
   "talk_codex_worker",
@@ -169,6 +191,7 @@ known-first-party = [
   "talk_grok_realtime",
   "talk_host",
   "talk_identity",
+  "talk_input_attachments",
   "talk_outbox",
   "talk_passive",
   "talk_lifecycle",

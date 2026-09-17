@@ -10,7 +10,7 @@ import time
 from collections import deque
 
 try:
-    from . import talk_identity
+    from . import talk_capabilities, talk_identity
     from . import talk_realtime as rt
     from .talk_dashboard_gateway import DashboardTaskError
     from .talk_live_config import resolve_live_auth, resolve_live_config
@@ -18,6 +18,7 @@ try:
     from .talk_live_transport import negotiate_live_browser
     from .talk_passive import digest
 except ImportError:  # pragma: no cover - flat plugin load
+    import talk_capabilities
     import talk_identity
     import talk_realtime as rt
     from talk_dashboard_gateway import DashboardTaskError
@@ -32,6 +33,12 @@ MAX_EVENTS = 512
 MAX_EVENT_BYTES = 2 * 1024 * 1024
 MAX_PENDING = 8
 MAX_DELEGATIONS = 1024
+CAPTURE_INTERVAL = 0.1
+CAPTURE_FRAGMENTS = 32
+CAPTURE_BYTES = 8192
+MAX_CAPTURE_FRAGMENTS = 4096
+MAX_CAPTURE_BYTES = 256 * 1024
+OPERATION_POLL_SECONDS = 0.25
 
 
 class RequestLease:
@@ -65,17 +72,32 @@ class BrowserBinding:
         self.events = deque()
         self.sequence = self.event_bytes = 0
         self.pending_fragments = []
-        self.fragments_seen = set()
+        self.fragments_seen = {}
         self.delegations_seen = set()
         self.pending = {}
         self.retired = set()
-        self.persist_queue = asyncio.Queue(maxsize=256)
+        self.persist_queue = deque()
+        self.capture_bytes = 0
+        self.capture_ready = asyncio.Event()
+        self.capture_full = asyncio.Event()
+        self.capture_lock = asyncio.Lock()
+        self.send_lock = asyncio.Lock()
+        self.operations = {}
+        self.deliveries = {}
+        self.delivered = set()
+        self.presentations = {}
+        self.speech_attempts = {}
+        self.typed_pending = set()
+        self.job_delegations = {}
+        self.closing = False
         self.tasks = set()
         self.closed = False
         self.failure = None
         self.polling = False
         self.last_state = 0.0
         self.results_seen = set()
+        self.active_jobs = set()
+        self.has_announcements = False
         self.input_results = {}
 
     def body(self, **values):
@@ -113,7 +135,7 @@ class BrowserBinding:
     async def pump(self):
         try:
             async for event in self.session:
-                if self.closed:
+                if self.closed or self.closing:
                     return
                 await self.authorize()
                 if isinstance(event, rt.Transcript):
@@ -122,9 +144,8 @@ class BrowserBinding:
                     self.delegate(event)
                 elif isinstance(event, rt.DelegationRetired):
                     self.retired.add(event.delegation_id)
-                    pending = self.pending.get(event.delegation_id)
-                    if pending:
-                        pending.cancel()
+                    # Speech interruption cannot retire an accepted Hermes operation.
+                    await self.retire_presentations(delegation_id=event.delegation_id)
                 elif isinstance(event, rt.ProviderFailure):
                     await self.fail("GPT-Live rejected a session event. Rejoin the task.")
                     return
@@ -139,61 +160,99 @@ class BrowserBinding:
             await self.fail("GPT-Live task connection failed. Rejoin the task.")
 
     async def transcript(self, event):
-        if not event.text:
-            return
-        identity = (
-            digest(
-                [
-                    event.item_id,
-                    str(event.role),
-                    event.text,
-                    event.final,
-                    event.start_ms,
-                    event.end_ms,
-                ]
-            )
-            if event.item_id
-            else (secrets.token_hex(16))
-        )
-        if identity in self.fragments_seen:
-            return
-        if len(self.fragments_seen) >= 4096:
-            raise DashboardTaskError("capacity", 409)
-        self.fragments_seen.add(identity)
+        identity = (digest([self.provider_session_id, event.event_id])
+                    if event.event_id else secrets.token_hex(16))
         fragment = {
-            "event_id": identity,
-            "role": str(event.role),
-            "text": event.text,
-            "final": event.final,
-            "start_ms": event.start_ms,
-            "end_ms": event.end_ms,
+            "event_id": identity, "role": str(event.role), "text": event.text,
+            "final": event.final, "start_ms": event.start_ms, "end_ms": event.end_ms,
         }
+        if event.item_id is not None:
+            fragment["item_id"] = event.item_id
+        if event.finality is not None:
+            fragment["finality"] = event.finality
+        fingerprint = digest(fragment)
+        previous = self.fragments_seen.get(identity)
+        if previous is not None:
+            if previous != fingerprint:
+                raise DashboardTaskError("event_conflict", 409)
+            return
+        size = len(event.text.encode("utf-8"))
+        if (len(self.persist_queue) >= MAX_CAPTURE_FRAGMENTS
+                or self.capture_bytes + size > MAX_CAPTURE_BYTES):
+            raise DashboardTaskError("capacity", 409)
         if event.role is rt.TranscriptRole.USER:
-            if len(self.pending_fragments) >= 256:
+            if (len(self.pending_fragments) >= MAX_CAPTURE_FRAGMENTS
+                    or sum(len(row["text"].encode("utf-8")) for row in self.pending_fragments)
+                    + size > MAX_CAPTURE_BYTES):
                 raise DashboardTaskError("capacity", 409)
             self.pending_fragments.append(fragment)
-        self.persist_queue.put_nowait(fragment)
-        self.emit("transcript", role=str(event.role), text=event.text, final=event.final)
+        self.fragments_seen[identity] = fingerprint
+        if len(self.fragments_seen) > MAX_CAPTURE_FRAGMENTS * 2:
+            self.fragments_seen.pop(next(iter(self.fragments_seen)))
+        self.persist_queue.append(fragment)
+        self.capture_bytes += size
+        self.capture_ready.set()
+        if len(self.persist_queue) >= CAPTURE_FRAGMENTS or self.capture_bytes >= CAPTURE_BYTES:
+            self.capture_full.set()
+        self.emit("transcript", **fragment)
+
+    async def flush_capture(self):
+        async with self.capture_lock:
+            remaining = len(self.persist_queue)
+            while remaining:
+                batch, size = [], 0
+                for fragment in self.persist_queue:
+                    width = len(fragment["text"].encode("utf-8"))
+                    if (len(batch) >= min(remaining, CAPTURE_FRAGMENTS)
+                            or (batch and size + width > CAPTURE_BYTES)):
+                        break
+                    batch.append(fragment)
+                    size += width
+                if not batch:
+                    raise DashboardTaskError("capacity", 409)
+                await self.authorize(write=True)
+                reply = await asyncio.to_thread(
+                    self.registry.coordinator.transcript, self.lease, self.body(fragments=batch),
+                )
+                expected = {row["event_id"] for row in batch}
+                acked = reply.get("acked_event_ids")
+                if (acked is None and reply.get("ok") is True
+                        and reply.get("captured") == len(batch)):
+                    acked = list(expected)
+                if (reply.get("ok") is not True or not isinstance(acked, list) or not acked
+                        or any(not isinstance(value, str) for value in acked)
+                        or not set(acked) <= expected):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                acknowledged = set(acked)
+                self.persist_queue = deque(row for row in self.persist_queue
+                                           if row["event_id"] not in acknowledged)
+                self.capture_bytes -= sum(len(row["text"].encode("utf-8")) for row in batch
+                                          if row["event_id"] in acknowledged)
+                remaining -= len(acknowledged)
+            if not self.persist_queue:
+                self.capture_ready.clear()
+            if len(self.persist_queue) < CAPTURE_FRAGMENTS and self.capture_bytes < CAPTURE_BYTES:
+                self.capture_full.clear()
+        return {"ok": True}
 
     async def persist(self):
         try:
-            while not self.closed:
-                fragment = await self.persist_queue.get()
-                await self.authorize(write=True)
-                await asyncio.to_thread(
-                    self.registry.coordinator.transcript,
-                    self.lease,
-                    self.body(fragments=[fragment]),
-                )
+            while not self.closed and not self.closing:
+                await self.capture_ready.wait()
+                if not self.capture_full.is_set():
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(self.capture_full.wait(), CAPTURE_INTERVAL)
+                await self.flush_capture()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - fail closed on lost canonical transcript ownership
+        except Exception:  # noqa: BLE001 - lost capture ownership closes audio, never claims a save
             await self.fail("Live transcript persistence failed. Rejoin the original task.")
 
     def delegate(self, event):
         if event.delegation_id in self.delegations_seen:
             return
-        if len(self.delegations_seen) >= MAX_DELEGATIONS or len(self.pending) >= MAX_PENDING:
+        if (len(self.delegations_seen) >= MAX_DELEGATIONS
+                or len(self.pending) + len(self.typed_pending) >= MAX_PENDING):
             raise DashboardTaskError("capacity", 409)
         self.delegations_seen.add(event.delegation_id)
         captured, future = [], []
@@ -212,33 +271,144 @@ class BrowserBinding:
         self.pending[event.delegation_id] = task
         task.add_done_callback(lambda _: self.pending.pop(event.delegation_id, None))
 
+    async def operation_result(self, response, *, delegation_id=None):
+        operation = response.get("operation_id")
+        if operation is None:
+            return response
+        protocol_id(operation)
+        current = response
+        while True:
+            await self.authorize()
+            if self.closed or self.closing:
+                raise asyncio.CancelledError
+            if current.get("operation_id") != operation or type(current.get("pending")) is not bool:
+                raise DashboardTaskError("gateway_response_invalid", 502)
+            state = current.get("state")
+            previous = self.operations.get(operation)
+            self.operations[operation] = {"state": state, "delegation_id": delegation_id}
+            if previous is None or previous["state"] != state:
+                self.emit("operation", operation_id=operation, state=state,
+                          pending=current["pending"])
+            if not current["pending"]:
+                if state not in {"completed", "uncertain", "failed"}:
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                result = current.get("result")
+                if not isinstance(result, dict):
+                    raise DashboardTaskError("gateway_response_invalid", 502)
+                return {**result, "operation_id": operation, "operation_state": state,
+                        "presentation": current.get("presentation")}
+            if state not in {"admitted", "deciding", "dispatching"}:
+                raise DashboardTaskError("gateway_response_invalid", 502)
+            await asyncio.sleep(OPERATION_POLL_SECONDS)
+            current = await asyncio.to_thread(
+                self.registry.coordinator.operation, self.lease, self.body(operation_id=operation),
+            )
+
+    async def deliver(self, key, commands, *, delegation_id=None, operation_id=None):
+        if key in self.delivered:
+            return
+        self.deliveries.setdefault(key, (commands, delegation_id, operation_id))
+        if delegation_id in self.retired:
+            return
+        async with self.send_lock:
+            if key not in self.deliveries or delegation_id in self.retired:
+                return
+            await self.authorize(write=True)
+            if self.closed or self.closing:
+                return
+            self.deliveries.pop(key, None)
+            self.delivered.add(key)
+            receipt = None
+            if operation_id is not None:
+                prepared = await asyncio.to_thread(
+                    self.registry.coordinator.presentation, self.lease,
+                    self.body(operation_id=operation_id, state="submitting"),
+                )
+                if prepared.get("ok") is not True or not prepared.get("speak"):
+                    return
+                receipt = self.body(operation_id=operation_id,
+                                    attempt_id=prepared["presentation"]["attempt_id"])
+                self.presentations[operation_id] = (receipt, delegation_id)
+            try:
+                await self.authorize(write=True)
+                if self.closed or self.closing:
+                    raise asyncio.CancelledError
+                await self.session.send(commands)
+                if receipt is not None:
+                    submitted = await asyncio.to_thread(
+                        self.registry.coordinator.presentation, self.lease,
+                        {**receipt, "state": "context_submitted"},
+                    )
+                    self.emit("delivery", operation_id=key, state="context_submitted",
+                              presentation=submitted["presentation"], playback_confirmed=False)
+                else:
+                    self.emit("delivery", operation_id=key, state="context_submitted",
+                              playback_confirmed=False)
+            except BaseException:
+                if receipt is not None:
+                    await self.retire_presentations(operation_id=operation_id)
+                raise
+
+    async def retire_presentations(self, *, operation_id=None, delegation_id=None):
+        for key, (receipt, delegation) in list(self.presentations.items()):
+            if operation_id is not None and key != operation_id:
+                continue
+            if delegation_id is not None and delegation != delegation_id:
+                continue
+            self.presentations.pop(key, None)
+            with contextlib.suppress(Exception):
+                retired = await asyncio.to_thread(
+                    self.registry.coordinator.presentation, self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+                self.emit("delivery", operation_id=key, state="unknown",
+                          presentation=retired["presentation"], playback_confirmed=False)
+
+    async def publish_result(self, result, *, delegation_id=None, input_id=None):
+        await self.authorize()
+        if self.closed or self.closing:
+            return
+        self.result_event(result)
+        run_id = (result.get("action") or {}).get("run_id")
+        if run_id is not None:
+            self.active_jobs.add(str(run_id))
+            if delegation_id is not None:
+                self.job_delegations[str(run_id)] = delegation_id
+        text = str(result.get("output") or "No task action was needed.")[:16000]
+        command = (rt.SubmitDelegationResult(delegation_id, text) if delegation_id is not None
+                   else rt.AppendLiveContext(text, kind="message"))
+        await self.deliver(result.get("operation_id") or delegation_id or input_id,
+                           [command], delegation_id=delegation_id,
+                           operation_id=result.get("operation_id"))
+
     async def decide(self, delegation_id, body):
         try:
+            await self.flush_capture()
             await self.authorize(write=True)
-            async with asyncio.timeout(35):
-                result = await self.registry.coordinator.delegation(self.lease, body)
+            result = await self.registry.coordinator.delegation(
+                self.lease, {**body, "admission": "async"},
+            )
+            result = await self.operation_result(result, delegation_id=delegation_id)
             await self.authorize()
-            if self.closed:
-                return
-            self.result_event(result)
-            if delegation_id not in self.retired:
-                await self.session.send(
-                    [
-                        rt.SubmitDelegationResult(
-                            delegation_id,
-                            str(result.get("output") or "No task action was needed.")[:16000],
-                        )
-                    ]
-                )
+            if not self.closed and not self.closing:
+                await self.publish_result(result, delegation_id=delegation_id)
         except asyncio.CancelledError:
-            # Cancelling this coroutine never issues stop/cancel to accepted Hermes work.
+            # Accepted coordinator operations keep running independently of this audio binding.
             raise
-        except Exception:  # noqa: BLE001 - durable task receipts remain available after failure
+        except Exception:  # noqa: BLE001 - durable receipts remain available after failure
             if not self.closed:
                 await self.fail("Live task decision failed. Inspect the task before retrying.")
 
     def result_event(self, result):
-        values = {key: result[key] for key in ("output", "action", "selection") if key in result}
+        operation_id = result.get("operation_id")
+        if operation_id is not None:
+            key = ("operation", operation_id)
+            if key in self.results_seen:
+                return
+            self.results_seen.add(key)
+        values = {key: result[key] for key in (
+            "output", "action", "selection", "operation_id", "operation_state", "presentation",
+        ) if key in result}
         action = result.get("action") or {}
         if action.get("run_id") is not None:
             values["run_id"] = action["run_id"]
@@ -253,37 +423,50 @@ class BrowserBinding:
             if text != original:
                 raise DashboardTaskError("event_conflict", 409)
             return await asyncio.shield(pending)
-        active_typed = sum(not task.done() for _, task in self.input_results.values())
+        active_typed = len(self.typed_pending)
         if (
             len(self.input_results) >= MAX_DELEGATIONS
             or len(self.pending) + active_typed >= MAX_PENDING
         ):
             raise DashboardTaskError("capacity", 409)
+        self.typed_pending.add(input_id)
         task = self.launch(self._typed(text, input_id))
         self.input_results[input_id] = text, task
+        task.add_done_callback(
+            lambda done: self.typed_pending.discard(input_id)
+            if done.cancelled() or done.exception() else None
+        )
         return await asyncio.shield(task)
 
     async def _typed(self, text, input_id):
+        await self.flush_capture()
         await self.authorize(write=True)
-        async with asyncio.timeout(35):
-            result = await self.registry.coordinator.typed(
-                self.lease,
-                self.body(input_id=input_id, text=text),
-            )
-        await self.authorize()
-        if self.closed:
-            raise DashboardTaskError("connection_stale", 409)
-        self.emit("transcript", role="user", text=text, final=True)
-        self.result_event(result)
-        await self.session.send(
-            [
-                rt.AppendLiveContext(
-                    str(result.get("output") or "Typed input received.")[:16000],
-                    kind="message",
-                )
-            ]
+        result = await self.registry.coordinator.typed(
+            self.lease, self.body(input_id=input_id, text=text, admission="async"),
         )
+        await self.authorize()
+        if self.closed or self.closing:
+            raise DashboardTaskError("connection_stale", 409)
+        self.emit("transcript", role="user", text=text, final=True, finality="turn",
+                  event_id=input_id, item_id=input_id)
+        if result.get("operation_id") is not None:
+            self.launch(self.finish_typed(result, input_id))
+            return {key: result[key] for key in ("ok", "operation_id", "state", "pending")}
+        await self.publish_result(result, input_id=input_id)
+        self.typed_pending.discard(input_id)
         return {"ok": True}
+
+    async def finish_typed(self, result, input_id):
+        try:
+            result = await self.operation_result(result)
+            await self.publish_result(result, input_id=input_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - accepted work survives transport failure
+            if not self.closed:
+                await self.fail("Live task decision failed. Inspect the task before retrying.")
+        finally:
+            self.typed_pending.discard(input_id)
 
     async def poll(self, after, timing=None):
         if type(after) is not int or after < 0 or after > self.sequence:
@@ -293,7 +476,11 @@ class BrowserBinding:
         while self.events and self.events[0][0]["sequence"] <= after:
             _, size = self.events.popleft()
             self.event_bytes -= size
-        if not self.closed and not self.polling and self.registry.clock() - self.last_state >= 5:
+        active = (self.active_jobs or self.pending or self.typed_pending or self.deliveries
+                  or self.has_announcements)
+        interval = 0.25 if active else 5.0
+        if (not self.closed and not self.polling
+                and self.registry.clock() - self.last_state >= interval):
             self.polling = True
             self.last_state = self.registry.clock()
             try:
@@ -303,8 +490,16 @@ class BrowserBinding:
         return {"ok": True, "events": [event for event, _ in self.events], "cursor": self.sequence}
 
     async def proactive(self, timing):
-        await self.authorize()
+        bound = await self.authorize()
+        if timing is not None:
+            with self.registry.manager._lock:
+                bound.speech_timing.observe(bound.token, timing)
         state = await asyncio.to_thread(self.registry.manager.state, self.lease, self.context)
+        self.active_jobs = {
+            str(job["run_id"]) for job in state.get("jobs", [])
+            if job.get("status") not in {"completed", "failed", "cancelled", "lost"}
+        }
+        self.has_announcements = bool(state.get("announcements"))
         for job in state.get("jobs", []):
             key = (job.get("run_id"), job.get("status"))
             if not job.get("result_available") or key in self.results_seen:
@@ -319,37 +514,79 @@ class BrowserBinding:
             else:
                 self.emit("result", result=result)
             self.results_seen.add(key)
-        typing = any(not task.done() for _, task in self.input_results.values())
-        if timing is None or self.pending or typing:
+        if timing is None:
             return
+        if bound.speech_timing.ready(bound.token):
+            self.retired.clear()
+            for key, (commands, delegation_id, operation_id) in list(self.deliveries.items())[:1]:
+                await self.deliver(key, commands, delegation_id=delegation_id,
+                                   operation_id=operation_id)
+                return
         for announcement in state.get("announcements", [])[:1]:
             prepared = await asyncio.to_thread(
                 self.registry.manager.speech,
                 self.lease,
-                {**self.context, "event_id": announcement["event_id"], "timing": timing},
+                {**self.context, "event_id": announcement["event_id"], "timing": timing,
+                 "presentation_protocol": 1, "playback_supported": False},
             )
             speech = speech_context(prepared)
             if not speech.get("speak"):
                 continue
-            receipt = {
-                **self.context,
-                "event_id": speech["event_id"],
-                "attempt_id": speech["attempt_id"],
-            }
-            try:
-                await self.authorize(write=True)
-                await self.session.send([rt.AppendLiveContext(speech["content"], kind="message")])
-            except BaseException:
-                with contextlib.suppress(Exception):
-                    await asyncio.to_thread(
-                        self.registry.manager.speech_receipt,
-                        self.lease,
-                        {**receipt, "state": "unknown"},
-                    )
-                raise
-            await asyncio.to_thread(
-                self.registry.manager.speech_receipt, self.lease, {**receipt, "state": "sent"}
+            await self.present(
+                speech, delegation_id=self.job_delegations.get(str(speech["run_id"]))
             )
+
+    def open_delegation(self, run_id):
+        """The provider delegation still awaiting this job's result, or None once retired."""
+        delegation_id = self.job_delegations.get(str(run_id))
+        if delegation_id is None or delegation_id in self.retired:
+            return None
+        return delegation_id
+
+    async def present(self, speech, *, delegation_id=None):
+        """Announce one prepared speech into this exact binding, fenced by its attempt receipt.
+
+        The persisted ``submitting`` receipt is the dispatch fence: a refusal sends nothing
+        and returns ``None``. After the send the attempt is ``context_submitted`` and that
+        receipt reply is returned; any failure in between persists ``unknown`` for this
+        attempt and re-raises, and nothing retries it.
+        """
+        receipt = {
+            **self.context,
+            "event_id": speech["event_id"],
+            "attempt_id": speech["attempt_id"],
+        }
+        try:
+            await self.authorize(write=True)
+            command = (rt.SubmitDelegationResult(delegation_id, speech["content"])
+                       if delegation_id else
+                       rt.AppendLiveContext(speech["content"], kind="message"))
+            async with self.send_lock:
+                dispatch = await asyncio.to_thread(
+                    self.registry.manager.speech_receipt, self.lease,
+                    {**receipt, "state": "submitting"},
+                )
+                if dispatch.get("ok") is not True:
+                    return None
+                self.speech_attempts[speech["event_id"]] = receipt
+                await self.authorize(write=True)
+                if self.closed or self.closing:
+                    raise asyncio.CancelledError
+                await self.session.send([command])
+            submitted = await asyncio.to_thread(
+                self.registry.manager.speech_receipt, self.lease,
+                {**receipt, "state": "context_submitted"},
+            )
+        except BaseException:
+            self.speech_attempts.pop(speech["event_id"], None)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    self.registry.manager.speech_receipt,
+                    self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+            raise
+        return submitted
 
     async def watch_lease(self):
         try:
@@ -372,8 +609,20 @@ class BrowserBinding:
         await self.close()
 
     async def close(self):
-        if self.closed:
+        if self.closed or self.closing:
             return
+        self.closing = True
+        await self.retire_presentations()
+        for receipt in list(self.speech_attempts.values()):
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    self.registry.manager.speech_receipt, self.lease,
+                    {**receipt, "state": "unknown"},
+                )
+        self.speech_attempts.clear()
+        with contextlib.suppress(Exception):
+            async with asyncio.timeout(5):
+                await self.flush_capture()
         self.closed = True
         current = asyncio.current_task()
         pending = [task for task in self.tasks if task is not current]
@@ -434,6 +683,7 @@ class LiveBrowserRegistry:
         require_auth,
         *,
         setup_factory=None,
+        catalog=None,
         coordinator=None,
         negotiate=None,
         env=None,
@@ -441,6 +691,7 @@ class LiveBrowserRegistry:
     ):
         self.manager, self.require_auth = manager, require_auth
         self.coordinator = coordinator or LiveCoordinator(manager, targets, tools)
+        self.catalog = catalog or talk_capabilities.status
         self.setup_factory = setup_factory or self.default_setup
         self.negotiate = negotiate or negotiate_live_browser
         self.env, self.clock = env, clock
@@ -453,16 +704,31 @@ class LiveBrowserRegistry:
         return rt.SessionSetup(
             model=config.model,
             voice=config.voice,
-            instructions=talk_identity.build_instructions(
-                None,
-                tools=[],
+            tools=[],
+            task_continuity=True,
+            instructions=talk_identity.build_live_instructions(
                 lane="dashboard",
-                canonical_task=True,
-                capabilities="Hermes owns task delegation; speak briefly while work continues.",
-            )
-            + "\n\n"
-            + self.manager.instructions(bound),
+                capabilities=self.capabilities(bound),
+                task_context=self.task_context(bound),
+            ),
         )
+
+    def capabilities(self, bound):
+        builder = getattr(self.manager, "live_capabilities", None)
+        if callable(builder):
+            return builder(bound)
+        return talk_identity.live_capabilities(self.catalog())
+
+    def task_context(self, bound):
+        builder = getattr(self.manager, "live_instructions", None)
+        if callable(builder):
+            return builder(bound)
+        history = self.manager._history(bound)
+        rows = [{"role": row["role"], "content": row["content"]}
+                for row in history.get("messages", []) if row.get("role") in {"user", "assistant"}
+                and isinstance(row.get("content"), str) and not row.get("hidden")][-12:]
+        return json.dumps({"selected_task": bound.selected_context, "history": rows},
+                          ensure_ascii=False)[:12000]
 
     async def create(self, request, body):
         if self.closed:

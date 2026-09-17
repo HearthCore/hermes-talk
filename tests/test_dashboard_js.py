@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from subprocess import run
 
@@ -61,7 +62,9 @@ const window = {
   sessionStorage: { getItem() { return ""; }, setItem() {} }, setTimeout, clearTimeout,
 };
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
-  window, setTimeout, clearTimeout, AbortController, console,
+  // btoa is a browser global, not an ECMAScript intrinsic, so a fresh vm context
+  // lacks it. Attachment encoding uses it exactly as a page would.
+  window, setTimeout, clearTimeout, AbortController, console, btoa,
 }, { filename: "index.js" });
 const Transport = window.__HERMES_TALK_TEST__.TalkTransport;
 const make = (generation = 3) => {
@@ -428,7 +431,9 @@ fetchOverride = (url, body) => {
   }
 };
 vm.runInNewContext(fs.readFileSync(process.argv[1], "utf8"), {
-  window, setTimeout, clearTimeout, AbortController, console,
+  // btoa is a browser global, not an ECMAScript intrinsic, so a fresh vm context
+  // lacks it. Attachment encoding uses it exactly as a page would.
+  window, setTimeout, clearTimeout, AbortController, console, btoa,
   document: { title: "Dashboard task page" }, navigator: { mediaDevices: {} },
     RTCPeerConnection: function () {},
 }, { filename: "index.js" });
@@ -448,6 +453,41 @@ const label = (tree) => !tree ? "" : typeof tree === "string" ? tree
 const button = (tree, text) => nodes(tree).find((node) => node.tag === "button" && label(
   node) === text);
 """
+
+
+def test_token_submission_refreshes_status_and_authorized_targets():
+    script = PAGE_HARNESS + r"""
+(async()=>{
+const baseFetch=fetchOverride, tokens=new Map();
+window.sessionStorage={getItem:key=>tokens.get(key)||'',
+  setItem:(key,value)=>tokens.set(key,value),removeItem:key=>tokens.delete(key)};
+fetchOverride=(url,body,opts)=>{
+  if(opts.headers['x-talk-token']!=='fixture-token') throw new Error('401: Talk token required');
+  return baseFetch(url,body);
+};
+render(); await drain();
+let tree=render();
+assert(button(tree,'Use token'),'Auth refusal must expose token entry');
+assert(label(tree).includes('Target list unavailable'));
+nodes(tree).find(node=>node.props.placeholder==='TALK_DASHBOARD_TOKEN')
+  .props.onChange({target:{value:'fixture-token'}});
+tree=render();button(tree,'Use token').props.onClick();
+render();await drain();tree=render();
+assert.equal(button(tree,'Use token'),undefined,'Accepted token should dismiss prompt');
+assert(!label(tree).includes('Target list unavailable'),'Task catalog must recover with status');
+assert(label(tree).includes('Selected task'),'Authorized tasks must load without a second click');
+assert.equal(requests.filter(row=>row.url.endsWith('/targets')).length,2);
+assert.equal(transports.length,0,'Token submission must not start audio');
+process.exit(0);
+})().catch(error=>{console.error(error);process.exit(1);});
+"""
+    result = run(
+        ["node", "-e", script, str(DASHBOARD_JS)],
+        capture_output=True,
+        text=True,
+        timeout=NODE_TIMEOUT_S,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 TARGET_PAGE_HARNESS = PAGE_HARNESS + r"""
@@ -695,6 +735,46 @@ process.exit(0);
         text=True, timeout=NODE_TIMEOUT_S, check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("origin", [
+    "file:///C:/Hermes/resources/app.asar.unpacked/dist/index.html",
+    "http://127.0.0.1:8080/",
+    "https://hermes.example/dashboard?private=value#fragment",
+])
+def test_session_switch_and_return_page_references_match_backend(origin):
+    from talk_dashboard_tasks import DashboardTasks
+
+    script = TARGET_PAGE_HARNESS + "\nwindow.location.href = " + json.dumps(origin) + r""";
+(async () => {
+await bootA();
+choose("Task or Bot target", "b"); click("Switch target"); await readyPage();
+click("Return to previous (1)"); await readyPage();
+const admissions = requests.filter(row => /\/(session|switch)$/.test(row.url));
+assert.equal(admissions.length, 3);
+assert.equal(latestTransport.session.task.target_id, "a");
+console.log(JSON.stringify(admissions.map(row => ({
+  route: row.url.endsWith('/session') ? 'session' : 'switch',
+  payload: row.url.endsWith('/session') ? row.body.task : row.body,
+}))));
+listeners.pagehide(); process.exit(0);
+})().catch(error => {console.error(error); process.exit(1);});
+"""
+    completed = run(
+        ["node", "-e", script, str(DASHBOARD_JS)], cwd=ROOT, capture_output=True,
+        text=True, timeout=NODE_TIMEOUT_S, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    admissions = json.loads(completed.stdout)
+    for admission in admissions:
+        payload = admission["payload"]
+        reference = DashboardTasks._page_reference(payload.get("page_reference"))
+        if origin.startswith("file:"):
+            assert "page_reference" not in payload
+            assert reference["state"] == "unavailable"
+        else:
+            assert reference["state"] == "referenced"
+            assert reference["url"] == origin.split("?", 1)[0]
 
 
 def test_dashboard_task_picker_rendering_and_page_generation_fences():
@@ -1616,7 +1696,7 @@ def test_synthetic_summary_isolated_from_inputs_tools_and_ordinary_response_link
   assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
   assert.equal(sent.filter(r=>r.type==='conversation.item.create').length,0);
   assert(errors.some(e=>e.includes('cannot call tools')));
-  assert(requests.some(r=>r.url.endsWith('/speech/receipt') && r.body.state==='sent'));
+  assert(requests.some(r=>r.url.endsWith('/speech/receipt') && r.body.state==='context_submitted'));
   assert(!requests.some(r=>r.body && r.body.state==='playback_acknowledged'));
   // A genuine input still has its own request and canonical settlement.
   await t.task.typed('Continue the discussion');
@@ -2085,6 +2165,107 @@ assert.equal(fullResults.length,1);
 assert.equal(fullResults[0].output,'<script>full available result</script>');
 assert(requests.some(r=>r.url.includes('/result?connection_id=bound-live-task&generation=9')));
 assert.equal(sent.length,0); assert.equal(requests.filter(r=>r.url.endsWith('/tool')).length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_transcript_rows_preserve_exact_deltas_and_late_item_identity():
+    script = TASK_HARNESS + r"""
+const append = window.__HERMES_TALK_TEST__.appendTranscriptRows;
+let rows = [];
+const add = (event) => { rows = append(rows, Object.assign({role:'user',final:false},event),
+  'row-'+event.event_id); };
+add({event_id:'a',item_id:'one',finality:'delta',text:'go',start_ms:0,end_ms:100});
+add({event_id:'b',item_id:'one',finality:'delta',text:' ',start_ms:100,end_ms:150});
+add({event_id:'c',item_id:'one',finality:'delta',text:'go',start_ms:150,end_ms:200});
+add({event_id:'d',item_id:'other',finality:'item',text:'Other turn',start_ms:1000,end_ms:1200});
+add({event_id:'item',item_id:'one',finality:'item',text:'go go\n ',start_ms:0,end_ms:250});
+assert.equal(rows[0].text,'go go\n '); assert.equal(rows[0].final,false);
+assert.equal(rows[1].text,'Other turn');
+add({event_id:'c',item_id:'one',finality:'delta',text:'go',start_ms:150,end_ms:200});
+assert.equal(rows[0].fragments.length,4,'same event ID replay duplicated an observation');
+add({event_id:'turn',item_id:'turn-one',finality:'turn',final:true,
+  text:'go go.\n ',start_ms:0,end_ms:300});
+assert.equal(rows.length,2); assert.equal(rows[0].text,'go go.\n '); assert(rows[0].final);
+add({event_id:'late',item_id:'one',finality:'delta',text:' go',start_ms:150,end_ms:200});
+assert.equal(rows[0].text,'go go.\n '); assert(rows[0].final);
+assert.equal(rows[0].fragments.at(-1).text,' go','late evidence was dropped');
+add({event_id:'new',finality:'delta',text:'Fresh words',start_ms:2000,end_ms:2200});
+assert.equal(rows.at(-1).text,'Fresh words'); assert.equal(rows.at(-1).final,false);
+assert(rows.every(row=>row.item_id !== 'new'),'event ID became item identity');
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_async_operation_receipts_do_not_claim_job_completion_or_stop_captions():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); const statuses=[]; t.cb.onStatus=value=>statuses.push(value);
+await t.start(); await waitFor(()=>!t.livePolling);
+liveFetch=(url)=>url.endsWith('/live/input') ?
+  {ok:true,operation_id:'operation-one',state:'admitted',pending:true} : undefined;
+assert.equal(await t.sendTyped('  Exact input  '),true);
+assert.equal(requests.filter(r=>r.url.endsWith('/live/input')).at(-1).body.admission,'async');
+liveFetch=(url)=>url.endsWith('/live/events') ? {ok:true,cursor:3,events:[
+  {sequence:1,type:'operation',operation_id:'operation-one',state:'deciding',pending:true},
+  {sequence:2,type:'transcript',role:'user',text:' ',final:false,finality:'delta',event_id:'space'},
+  {sequence:3,type:'operation',operation_id:'operation-one',state:'completed',pending:false},
+]} : undefined;
+await pollNow(t);
+assert.equal(captions[0].text,' '); assert.equal(captions[0].final,false);
+assert.equal(t.operations.get('operation-one').state,'completed');
+assert(statuses.at(-1).includes('job status is shown separately'));
+assert.equal(fullResults.length,0); assert.equal(sent.length,0);
+t.stop();
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_close_stops_local_audio_before_waiting_for_capture_and_revokes_after_ack():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+let release;
+liveFetch=(url)=>url.endsWith('/live/close') ? new Promise(resolve=>{
+  release=()=>resolve({ok:true});
+}) : undefined;
+t.stop();
+assert(tracks[0].stopped && audioElements[0].paused && t.task.closed);
+assert.equal(requests.filter(r=>r.url==='/api/plugins/hermes-talk/close').length,0,
+  'task revoked before pending transcript flush');
+t.stop(); assert.equal(requests.filter(r=>r.url.endsWith('/live/close')).length,1);
+release(); await drain();
+assert.equal(requests.filter(r=>r.url==='/api/plugins/hermes-talk/close').length,1);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+    result = run(["node", "-e", script, str(DASHBOARD_JS)], capture_output=True,
+                 text=True, timeout=NODE_TIMEOUT_S)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_live_snapshot_waits_for_capture_ack_without_blocking_event_polling():
+    script = LIVE_HARNESS + r"""
+(async()=>{
+const t=makeLive(); await t.start(); await waitFor(()=>!t.livePolling);
+let release;
+liveFetch=(url)=>url.endsWith('/live/flush') ? new Promise(resolve=>{
+  release=()=>resolve({ok:true});
+}) : undefined;
+const before=requests.filter(r=>r.url.endsWith('/state')).length;
+const pending=t.task.refresh(); await waitFor(()=>release);
+assert.equal(requests.filter(r=>r.url.endsWith('/state')).length,before);
+await pollNow(t); assert(!t.closed);
+release(); await pending;
+assert.equal(requests.filter(r=>r.url.endsWith('/state')).length,before+1);
 t.stop();
 })().catch(e=>{console.error(e);process.exitCode=1;});
 """
