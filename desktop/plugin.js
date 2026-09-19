@@ -2290,7 +2290,7 @@ function createTalkSurface(SDK) {
         setError("Talk needs a browser with WebRTC and microphone access.");
         return;
       }
-      if (status && status.voiceMode === "live" && !selectedTask && !taskBinding) {
+      if (status && status.voiceMode === "live" && !selectedTask && taskBinding) {
         setError("Choose an authorized task before starting GPT-Live.");
         return;
       }
